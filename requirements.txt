@@ -2,8 +2,5 @@ flask
 requests
 gunicorn
 python-dotenv
-huggingface_hub
-transformers
 numpy
 pandas
-torch
