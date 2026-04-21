@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+lib/kronos/model/
+lib/kronos/tokenizer/
+lib/kronos/repo/
+*.pt
+*.bin
