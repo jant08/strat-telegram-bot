@@ -1,112 +1,54 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  KRONUS AI — MAIN SERVER  (v4)                              ║
-║  TradingView Pine v4 → Claude AI → Telegram (interactive)   ║
-║  Gold / Silver Futures (MGC, MSI, GC, SI)                   ║
+║  KRONUS AI — MAIN SERVER  (v4.2 — fast-first alerts)        ║
 ║                                                              ║
-║  NEW in v4:                                                 ║
-║   - Functional /callback handler (Confirm / Skip actually   ║
-║     do something — journal the trade, update the message)  ║
-║   - Two-column button UI with menu commands                 ║
-║   - /menu, /positions, /today, /help Telegram commands      ║
-║   - In-memory paper journal (Phase 1 of auto-execution)     ║
-║   - Telegram webhook setter endpoint (/setup_telegram)      ║
+║  CRITICAL CHANGE vs v4.1:                                    ║
+║   - Telegram alert fires IMMEDIATELY with raw signal data    ║
+║     (tier, entry, stop, targets, TFC, ICC, FVG, CCT).        ║
+║     Target latency: 2-5 seconds from bar close.              ║
+║   - Claude analysis runs in background AFTER alert sent.     ║
+║     When verdict comes back, the message is EDITED to        ║
+║     append Claude's take. Typically adds 4-8 seconds.        ║
+║   - If Claude is slow (>8s) or fails, the fast alert is      ║
+║     already on your phone with everything you need.          ║
+║                                                              ║
+║  You lose nothing. Alert speed matches ICC/CCT strategy.     ║
 ╚══════════════════════════════════════════════════════════════╝
 """
-import os, json, logging, requests
+import os, json, logging, requests, threading
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
-# ── LOGGING ───────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── CONFIG (Render env variables) ─────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "goldstrat2025")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
-PUBLIC_URL        = os.environ.get("PUBLIC_URL", "")  # e.g. https://your-app.onrender.com
+CLAUDE_MODEL      = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_TIMEOUT    = int(os.environ.get("CLAUDE_TIMEOUT", "8"))   # seconds
+CLAUDE_ENABLED    = os.environ.get("CLAUDE_ENABLED", "true").lower() == "true"
+PUBLIC_URL        = os.environ.get("PUBLIC_URL", "")
 
-# ── IN-MEMORY JOURNAL (Phase 1 tracking) ──────────────────────
-# Simple list, resets on restart. For persistence, swap for SQLite or Render KV.
-JOURNAL = []            # all confirmed trades
-SKIPPED = []            # all skipped signals
-PENDING = {}            # signals waiting for button press: message_id -> sig dict
-
-# ═══════════════════════════════════════════════════════════════
-#  CLAUDE AI — LENIENT ANALYSIS
-# ═══════════════════════════════════════════════════════════════
-def analyze(sig: dict) -> dict:
-    if not ANTHROPIC_API_KEY:
-        return {"verdict": "REVIEW", "confidence": "N/A",
-                "key_factor": "Claude API key missing",
-                "reasoning": "Add ANTHROPIC_API_KEY in Render env vars."}
-
-    prompt = f"""You are reviewing a live futures trade signal from a proven Strat + ICC + CCT system.
-
-YOUR ROLE: LENIENT. Trust the scoring. Approve most A+ and B setups. Only flag WAIT if there is a clear red flag (e.g. setup directly against 3/3 higher-timeframe bias with no confluence, or tier C).
-
-SIGNAL:
- • {sig.get('symbol')} {sig.get('signal')} — {sig.get('combo')}
- • Tier {sig.get('tier')} | Score {sig.get('score')}/100 | {sig.get('session')} session | {sig.get('tf')}m
- • Entry {sig.get('price')} | Stop {sig.get('stop')} | TP1 {sig.get('target1')} | TP2 {sig.get('target2')}
-
-CONTEXT:
- • TFC: 4H {sig.get('tfc_4h')} / 1H {sig.get('tfc_1h')} / 15m {sig.get('tfc_15')}
- • ICC: {sig.get('icc')} | FVG: {sig.get('fvg')} | Near: {sig.get('near_level')}
- • CCT window: {sig.get('cct_open')} ({sig.get('mins_to_close')}m to daily close)
- • ATR: {sig.get('atr')}
-
-Return ONLY valid JSON (no markdown, no extra text):
-{{"verdict":"BUY|SELL|WAIT","confidence":"HIGH|MEDIUM|LOW","key_factor":"one sentence","reasoning":"2-3 sentences"}}
-
-BUY = approve a LONG. SELL = approve a SHORT. WAIT = skip (use sparingly)."""
-
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json"
-            },
-            json={
-                "model":      CLAUDE_MODEL,
-                "max_tokens": 400,
-                "messages":   [{"role": "user", "content": prompt}]
-            },
-            timeout=20
-        )
-        r.raise_for_status()
-        text = r.json()["content"][0]["text"].strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip().rstrip("`").strip()
-        return json.loads(text)
-    except Exception as e:
-        log.error(f"Claude error: {e}")
-        return {"verdict": "REVIEW", "confidence": "N/A",
-                "key_factor": "Claude API error",
-                "reasoning": f"Review manually. ({str(e)[:120]})"}
+JOURNAL = []
+SKIPPED = []
+PENDING = {}
 
 # ═══════════════════════════════════════════════════════════════
-#  TELEGRAM — send / edit / answer callbacks
+#  TELEGRAM LOW-LEVEL
 # ═══════════════════════════════════════════════════════════════
-def tg_api(method: str, payload: dict) -> dict:
-    """Low-level Telegram API call. Returns JSON or empty dict on failure."""
+def tg_api(method: str, payload: dict, timeout: int = 5) -> dict:
     if not TELEGRAM_TOKEN:
         return {}
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
-            json=payload, timeout=10)
+            json=payload, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -114,7 +56,6 @@ def tg_api(method: str, payload: dict) -> dict:
         return {}
 
 def signal_buttons(sig: dict) -> dict:
-    """Two-column button grid for a fresh signal alert."""
     sym = sig.get("symbol", "?")
     direction = sig.get("signal", "?")
     return {"inline_keyboard": [
@@ -133,7 +74,6 @@ def signal_buttons(sig: dict) -> dict:
     ]}
 
 def menu_buttons() -> dict:
-    """Main menu grid — sent on /menu command."""
     return {"inline_keyboard": [
         [
             {"text": "📊 Today's P&L",  "callback_data": "today"},
@@ -149,7 +89,35 @@ def menu_buttons() -> dict:
         ],
     ]}
 
-def format_signal_msg(sig: dict, ana: dict) -> str:
+# ═══════════════════════════════════════════════════════════════
+#  MESSAGE FORMATTERS
+# ═══════════════════════════════════════════════════════════════
+def format_fast_alert(sig: dict) -> str:
+    """Raw signal alert — NO Claude verdict yet. Goes out in 2-3 seconds."""
+    dir_emoji = "📈" if sig.get("signal") == "LONG" else "📉"
+    cct_txt = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
+    icc_txt = "✓" if sig.get("icc") else "—"
+    fvg_txt = "✓" if sig.get("fvg") else "—"
+
+    return (
+        f"{dir_emoji} *{sig.get('symbol')} — {sig.get('signal')}*  ⚡\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*Tier:* {sig.get('tier')}  |  *Score:* {sig.get('score')}/100\n"
+        f"*Session:* {sig.get('session')}  |  *TF:* {sig.get('tf')}m\n"
+        f"*Combo:* {sig.get('combo')}\n\n"
+        f"*Entry:* `{sig.get('price')}`\n"
+        f"*Stop:*  `{sig.get('stop')}`\n"
+        f"*TP1:*   `{sig.get('target1')}`\n"
+        f"*TP2:*   `{sig.get('target2')}`\n\n"
+        f"*TFC:* 4H {sig.get('tfc_4h')} / 1H {sig.get('tfc_1h')} / 15m {sig.get('tfc_15')}\n"
+        f"*ICC:* {icc_txt}  |  *FVG:* {fvg_txt}  |  *Lvl:* {sig.get('near_level')}\n"
+        f"*CCT:* {cct_txt}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 _Claude analysis loading..._"
+    )
+
+def format_enriched_alert(sig: dict, ana: dict) -> str:
+    """Same alert, but Claude's verdict has landed — append it."""
     dir_emoji = "📈" if sig.get("signal") == "LONG" else "📉"
     v = ana.get("verdict", "REVIEW")
     v_emoji = {"BUY": "✅", "SELL": "✅", "WAIT": "⏸", "REVIEW": "⚠️"}.get(v, "•")
@@ -176,24 +144,24 @@ def format_signal_msg(sig: dict, ana: dict) -> str:
         f"{ana.get('reasoning')}"
     )
 
-def send_signal(sig: dict, ana: dict) -> int:
-    """Send a full signal alert with buttons. Returns message_id or 0."""
+def send_fast_alert(sig: dict) -> int:
+    """Send the raw signal immediately with buttons. Returns message_id."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("Telegram not configured")
         return 0
     resp = tg_api("sendMessage", {
         "chat_id":      TELEGRAM_CHAT_ID,
-        "text":         format_signal_msg(sig, ana),
+        "text":         format_fast_alert(sig),
         "parse_mode":   "Markdown",
         "reply_markup": signal_buttons(sig),
     })
     msg_id = resp.get("result", {}).get("message_id", 0)
     if msg_id:
-        PENDING[msg_id] = {"sig": sig, "ana": ana, "ts": datetime.now(timezone.utc).isoformat()}
+        PENDING[msg_id] = {"sig": sig, "ana": None,
+                           "ts": datetime.now(timezone.utc).isoformat()}
     return msg_id
 
 def send_text(text: str, buttons: dict = None) -> int:
-    """Send a plain text message, optionally with buttons."""
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     if buttons:
         payload["reply_markup"] = buttons
@@ -201,7 +169,6 @@ def send_text(text: str, buttons: dict = None) -> int:
     return resp.get("result", {}).get("message_id", 0)
 
 def edit_message(message_id: int, new_text: str, buttons: dict = None):
-    """Edit an existing message — used to mark Confirm/Skip as done."""
     payload = {
         "chat_id":    TELEGRAM_CHAT_ID,
         "message_id": message_id,
@@ -213,12 +180,91 @@ def edit_message(message_id: int, new_text: str, buttons: dict = None):
     tg_api("editMessageText", payload)
 
 def answer_callback(callback_id: str, text: str = "", alert: bool = False):
-    """Acknowledge a button press (removes the 'loading' spinner on the button)."""
     tg_api("answerCallbackQuery", {
         "callback_query_id": callback_id,
         "text":              text,
         "show_alert":        alert,
     })
+
+# ═══════════════════════════════════════════════════════════════
+#  CLAUDE — called AFTER fast alert is sent
+# ═══════════════════════════════════════════════════════════════
+def analyze(sig: dict) -> dict:
+    if not CLAUDE_ENABLED or not ANTHROPIC_API_KEY:
+        return {"verdict": "REVIEW", "confidence": "N/A",
+                "key_factor": "Claude disabled or no key",
+                "reasoning": "Trade the signal on its own merits."}
+
+    prompt = f"""You are reviewing a live futures trade signal from a Strat + ICC + CCT system.
+
+ROLE: LENIENT. Trust the scoring. Approve most A+ and B setups. Only flag WAIT if there's a clear red flag (setup against 3/3 HTF bias with no confluence, or tier C).
+
+SIGNAL:
+ • {sig.get('symbol')} {sig.get('signal')} — {sig.get('combo')}
+ • Tier {sig.get('tier')} | Score {sig.get('score')}/100 | {sig.get('session')} | {sig.get('tf')}m
+ • Entry {sig.get('price')} | Stop {sig.get('stop')} | TP1 {sig.get('target1')} | TP2 {sig.get('target2')}
+ • TFC: 4H {sig.get('tfc_4h')} / 1H {sig.get('tfc_1h')} / 15m {sig.get('tfc_15')}
+ • ICC: {sig.get('icc')} | FVG: {sig.get('fvg')} | Near: {sig.get('near_level')}
+ • CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m to close) | ATR: {sig.get('atr')}
+
+Return ONLY valid JSON:
+{{"verdict":"BUY|SELL|WAIT","confidence":"HIGH|MEDIUM|LOW","key_factor":"one sentence","reasoning":"2 sentences max"}}"""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json"
+            },
+            json={"model": CLAUDE_MODEL, "max_tokens": 250,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=CLAUDE_TIMEOUT
+        )
+        r.raise_for_status()
+        text = r.json()["content"][0]["text"].strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip().rstrip("`").strip()
+        return json.loads(text)
+    except requests.exceptions.Timeout:
+        log.warning(f"Claude timeout after {CLAUDE_TIMEOUT}s — using fallback")
+        return {"verdict": "REVIEW", "confidence": "N/A",
+                "key_factor": "Claude timed out",
+                "reasoning": "Trade the signal on your own read — analysis took too long."}
+    except Exception as e:
+        log.error(f"Claude error: {e}")
+        return {"verdict": "REVIEW", "confidence": "N/A",
+                "key_factor": "Claude API error",
+                "reasoning": f"Review manually. ({str(e)[:100]})"}
+
+# ═══════════════════════════════════════════════════════════════
+#  BACKGROUND WORKER — fast alert first, Claude enrichment after
+# ═══════════════════════════════════════════════════════════════
+def process_signal_async(sig: dict):
+    """Runs in a thread. Sends fast alert, then calls Claude, then edits."""
+    try:
+        # Step 1: fast alert out the door (~2s)
+        msg_id = send_fast_alert(sig)
+        if not msg_id:
+            log.error("Fast alert failed to send — aborting Claude enrichment")
+            return
+        log.info(f"Fast alert sent, message_id={msg_id}")
+
+        # Step 2: call Claude (up to CLAUDE_TIMEOUT seconds)
+        ana = analyze(sig)
+        log.info(f"Claude verdict: {ana.get('verdict')} ({ana.get('confidence')})")
+
+        # Step 3: enrich the existing message with Claude's take
+        if msg_id in PENDING:
+            PENDING[msg_id]["ana"] = ana
+        edit_message(msg_id, format_enriched_alert(sig, ana), signal_buttons(sig))
+        log.info(f"Message {msg_id} enriched with Claude verdict")
+    except Exception as e:
+        log.error(f"Background processing error: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 #  JOURNAL HELPERS
@@ -266,32 +312,24 @@ def recent_skipped() -> str:
 def help_text() -> str:
     return (
         "*📖 Kronus AI — Help*\n\n"
-        "When a signal fires you'll see a message with buttons:\n"
-        "• *✅ Take Trade* — marks the trade as confirmed and logs it to the journal "
-        "(paper trade — no broker order is placed yet).\n"
-        "• *⏸ Skip* — logs that you passed on this one.\n\n"
-        "*Commands you can type:*\n"
-        "`/menu` — main menu\n"
-        "`/today` — today's activity\n"
-        "`/journal` — last 10 confirmed trades\n"
-        "`/skipped` — last 10 skipped signals\n"
-        "`/status` — server status\n"
-        "`/help` — this message\n\n"
-        "_Phase 1: manual confirmation + journaling. "
-        "Phase 2 (broker auto-execution) will be added after ~50 signals "
-        "are validated here._"
+        "Every alert fires in ~3 seconds with full signal data. "
+        "Claude's take updates the message a few seconds later (⚡ icon = still loading).\n\n"
+        "• *✅ Take Trade* — logs to journal.\n"
+        "• *⏸ Skip* — logs the pass.\n\n"
+        "*Commands:*\n"
+        "`/menu` `/today` `/journal` `/skipped` `/status` `/help`\n\n"
+        "_Phase 1: manual confirm + journaling. "
+        "Phase 2 (broker auto-execution) after ~50 validated signals._"
     )
 
 def status_text() -> str:
     return (
         "*⚙️ Kronus AI — Status*\n\n"
-        f"Version: *v4*\n"
-        f"Claude: {'✅ enabled' if ANTHROPIC_API_KEY else '❌ disabled'}\n"
-        f"Telegram: {'✅ enabled' if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else '❌ disabled'}\n"
-        f"Model: `{CLAUDE_MODEL}`\n\n"
-        f"Signals pending decision: *{len(PENDING)}*\n"
-        f"Journal entries: *{len(JOURNAL)}*\n"
-        f"Skipped: *{len(SKIPPED)}*\n"
+        f"Version: *v4.2 (fast-first)*\n"
+        f"Claude: {'✅ ' + CLAUDE_MODEL if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else '❌ disabled'}\n"
+        f"Claude timeout: {CLAUDE_TIMEOUT}s\n"
+        f"Telegram: {'✅ enabled' if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else '❌ disabled'}\n\n"
+        f"Pending: *{len(PENDING)}*  |  Journal: *{len(JOURNAL)}*  |  Skipped: *{len(SKIPPED)}*"
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -300,18 +338,19 @@ def status_text() -> str:
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "status":   "running",
-        "bot":      "Kronus AI v4 — Strat + Claude + interactive UI",
-        "claude":   "enabled" if ANTHROPIC_API_KEY else "disabled",
-        "telegram": "enabled" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
-        "model":    CLAUDE_MODEL,
-        "journal":  len(JOURNAL),
-        "pending":  len(PENDING),
+        "status":         "running",
+        "bot":            "Kronus AI v4.2 — fast-first alerts",
+        "claude":         "enabled" if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else "disabled",
+        "claude_model":   CLAUDE_MODEL,
+        "claude_timeout": CLAUDE_TIMEOUT,
+        "telegram":       "enabled" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
+        "journal":        len(JOURNAL),
+        "pending":        len(PENDING),
     })
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """TradingView → Kronus. Receives a signal, analyzes, sends Telegram."""
+    """TradingView → Kronus. Responds instantly, processes async."""
     try:
         raw = request.get_data(as_text=True)
         log.info(f"Webhook in: {raw[:250]}")
@@ -324,26 +363,15 @@ def webhook():
         log.warning("Invalid secret")
         return jsonify({"error": "unauthorized"}), 401
 
-    ana = analyze(sig)
-    log.info(f"Claude verdict: {ana.get('verdict')} ({ana.get('confidence')})")
-
-    msg_id = 0
-    if ana.get("verdict") in ("BUY", "SELL", "REVIEW"):
-        msg_id = send_signal(sig, ana)
-
-    return jsonify({
-        "status":     "processed",
-        "verdict":    ana.get("verdict"),
-        "message_id": msg_id,
-    })
+    thread = threading.Thread(target=process_signal_async, args=(sig,), daemon=True)
+    thread.start()
+    return jsonify({"status": "accepted"}), 200
 
 @app.route("/telegram", methods=["POST"])
 def telegram_update():
-    """Receives updates from Telegram — button presses AND slash commands."""
     upd = request.get_json(silent=True) or {}
     log.info(f"Telegram update: {json.dumps(upd)[:300]}")
 
-    # ── Button press (callback_query) ─────────────────────────
     if "callback_query" in upd:
         cb      = upd["callback_query"]
         cb_id   = cb.get("id", "")
@@ -360,14 +388,13 @@ def telegram_update():
                 JOURNAL.append(pending)
                 sig = pending["sig"]
                 answer_callback(cb_id, f"✅ Trade logged: {sig.get('symbol')} {sig.get('signal')}")
-                # Update the original message to show it was confirmed
                 new_text = msg.get("text", "") + f"\n\n✅ *CONFIRMED* at {datetime.now().strftime('%H:%M:%S')}"
                 edit_message(msg_id, new_text, buttons={"inline_keyboard": [[
                     {"text": "📊 Today", "callback_data": "today"},
                     {"text": "📋 Journal", "callback_data": "journal"},
                 ]]})
             else:
-                answer_callback(cb_id, "⚠️ Signal no longer pending (already acted on?)", alert=True)
+                answer_callback(cb_id, "⚠️ Already acted on", alert=True)
 
         elif action == "skip":
             pending = PENDING.pop(msg_id, None)
@@ -377,30 +404,24 @@ def telegram_update():
                 new_text = msg.get("text", "") + f"\n\n⏸ *SKIPPED* at {datetime.now().strftime('%H:%M:%S')}"
                 edit_message(msg_id, new_text, buttons=None)
             else:
-                answer_callback(cb_id, "⚠️ Signal no longer pending", alert=True)
+                answer_callback(cb_id, "⚠️ Already acted on", alert=True)
 
         elif action == "today":
-            answer_callback(cb_id)
-            send_text(today_stats(), menu_buttons())
+            answer_callback(cb_id); send_text(today_stats(), menu_buttons())
         elif action == "journal":
-            answer_callback(cb_id)
-            send_text(recent_journal(), menu_buttons())
+            answer_callback(cb_id); send_text(recent_journal(), menu_buttons())
         elif action == "skipped":
-            answer_callback(cb_id)
-            send_text(recent_skipped(), menu_buttons())
-        elif action == "status" or action == "positions":
-            answer_callback(cb_id)
-            send_text(status_text(), menu_buttons())
+            answer_callback(cb_id); send_text(recent_skipped(), menu_buttons())
+        elif action in ("status", "positions"):
+            answer_callback(cb_id); send_text(status_text(), menu_buttons())
         elif action == "help":
-            answer_callback(cb_id)
-            send_text(help_text(), menu_buttons())
+            answer_callback(cb_id); send_text(help_text(), menu_buttons())
         elif action == "adjust":
-            answer_callback(cb_id, "🎯 SL/TP adjustment is a Phase 2 feature", alert=True)
+            answer_callback(cb_id, "🎯 Phase 2 feature", alert=True)
         else:
             answer_callback(cb_id, "Unknown action")
         return jsonify({"ok": True})
 
-    # ── Slash command (message) ───────────────────────────────
     if "message" in upd:
         text = upd["message"].get("text", "").strip().lower()
         if text in ("/menu", "/start"):
@@ -421,20 +442,22 @@ def telegram_update():
 
 @app.route("/setup_telegram", methods=["GET"])
 def setup_telegram():
-    """One-time: register this Render app as the Telegram webhook target.
-       Visit this URL once after deploy: https://your-app.onrender.com/setup_telegram"""
     if not TELEGRAM_TOKEN:
         return jsonify({"error": "TELEGRAM_TOKEN not set"}), 400
     if not PUBLIC_URL:
-        return jsonify({"error": "PUBLIC_URL env var not set (e.g. https://your-app.onrender.com)"}), 400
+        return jsonify({"error": "PUBLIC_URL env var not set"}), 400
     target = f"{PUBLIC_URL.rstrip('/')}/telegram"
     resp = tg_api("setWebhook", {"url": target,
                                  "allowed_updates": ["message", "callback_query"]})
     return jsonify({"target": target, "telegram_response": resp})
 
+@app.route("/ping", methods=["GET"])
+def ping():
+    """Keep-alive — point UptimeRobot here every 5 min to avoid sleep."""
+    return jsonify({"pong": True, "ts": datetime.now(timezone.utc).isoformat()})
+
 @app.route("/test", methods=["GET"])
 def test():
-    """Fire a fake A+ signal through the full pipeline."""
     fake = {
         "secret": WEBHOOK_SECRET, "symbol": "MGC1!", "tf": "15", "session": "NY-AM",
         "tier": "A+", "score": 85, "signal": "LONG", "combo": "2-2 Bull",
@@ -443,11 +466,11 @@ def test():
         "icc": True, "fvg": True, "near_level": "PDH",
         "cct_open": True, "mins_to_close": 18, "atr": 1.67,
     }
-    ana = analyze(fake)
-    msg_id = send_signal(fake, ana)
-    return jsonify({"test": "complete", "verdict": ana.get("verdict"), "message_id": msg_id})
+    thread = threading.Thread(target=process_signal_async, args=(fake,), daemon=True)
+    thread.start()
+    return jsonify({"test": "dispatched", "note": "check Telegram — fast alert first, Claude verdict enriches in a few seconds"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    log.info(f"Kronus AI v4 starting on port {port}")
-    app.run(host="0.0.0.0", port=port)
+    log.info(f"Kronus AI v4.2 (fast-first) starting on port {port}")
+    app.run(host="0.0.0.0", port=port, threaded=True)
