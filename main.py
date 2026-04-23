@@ -1,36 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  KRONUS AI — MAIN SERVER  (v5 — outcomes + paper mode)      ║
+║  KRONUS AI — MAIN SERVER  (v5.2 — timeout fix)              ║
 ║                                                              ║
-║  NEW vs v4.2:                                                ║
-║   • Every signal auto-tracked for outcome via yfinance:      ║
-║     TP1 / TP2 / STOP / TIMEOUT  (confirmed, paper, AND       ║
-║     skipped — so you see what you missed).                   ║
-║   • Three-state action: ✅ Live / 📝 Paper / ⏸ Skip           ║
-║   • MFE/MAE recorded on every trade for later analysis.      ║
-║   • Persistent state (JSON file, atomic writes) — survives   ║
-║     server restarts on persistent-disk hosts.                ║
-║   • Thread-safe (RLock) — no data races on shared state.     ║
-║   • Graceful degradation everywhere:                         ║
-║       - yfinance missing → tracker disabled, rest works      ║
-║       - Symbol not mapped → logged once, skipped             ║
-║       - yfinance errors → retried next poll cycle            ║
-║       - Disk write fails → logged, keeps running in-memory   ║
-║       - Thread errors → caught per iteration, loop survives  ║
-║       - Telegram edit fails → logged, pipeline continues     ║
-║       - Bad webhook → validated & rejected with reason       ║
-║   • Memory bounded: resolved trades >30d auto-purged on boot.║
-║   • /outcomes JSON endpoint for external analysis.           ║
+║  NEW vs v5.1:                                                ║
+║   • Timeout check now runs INDEPENDENTLY of yfinance.       ║
+║     Old behavior: if yfinance failed to fetch price, the    ║
+║     timeout check never ran → trades stayed open forever.   ║
+║     New behavior: every poll cycle, ALL active trades are   ║
+║     checked for >4hr age first. yfinance is best-effort     ║
+║     for TP/STOP detection but no longer blocks timeouts.    ║
 ║                                                              ║
-║  REQUIREMENTS:                                               ║
-║    pip install flask requests yfinance pandas                ║
-║                                                              ║
-║  ENV VARS (all optional except TELEGRAM_* for alerts):       ║
-║    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, WEBHOOK_SECRET,         ║
-║    ANTHROPIC_API_KEY, CLAUDE_MODEL, CLAUDE_TIMEOUT (8),      ║
-║    CLAUDE_ENABLED (true), PUBLIC_URL, STATE_FILE,            ║
-║    OUTCOME_POLL_SEC (60), TRADE_TIMEOUT_HRS (4),             ║
-║    PURGE_DAYS (30)                                           ║
+║   • Added /debug endpoint — shows what state every active   ║
+║     trade is in plus when last yfinance check ran. If a     ║
+║     trade ever stays open past timeout again, you can hit   ║
+║     this endpoint to see exactly why.                        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 import os
@@ -44,7 +27,6 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, jsonify
 
-# ── Optional: outcome tracking dependencies ───────────────────
 try:
     import yfinance as yf
     import pandas as pd
@@ -57,8 +39,7 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 if not OUTCOME_TRACKING_AVAILABLE:
-    log.warning("yfinance/pandas missing — outcome tracking DISABLED. "
-                "Install: pip install yfinance pandas")
+    log.warning("yfinance/pandas missing — outcome tracking DISABLED.")
 
 app = Flask(__name__)
 
@@ -77,36 +58,84 @@ OUTCOME_POLL_SEC  = int(os.environ.get("OUTCOME_POLL_SEC", "60"))
 TRADE_TIMEOUT_HRS = int(os.environ.get("TRADE_TIMEOUT_HRS", "4"))
 PURGE_DAYS        = int(os.environ.get("PURGE_DAYS", "30"))
 
-# ── SYMBOL MAPPING (TradingView → yfinance) ───────────────────
-# Extend as you add instruments. Missing symbols just skip tracking.
+FILTER_SESSIONS  = os.environ.get("FILTER_SESSIONS", "true").lower() == "true"
+ALLOWED_SESSIONS = [
+    s.strip().upper()
+    for s in os.environ.get("ALLOWED_SESSIONS", "NY-AM,LONDON,LONDON-AM,NY-OPEN").split(",")
+    if s.strip()
+]
+
+# ── CHECKLIST STATE ───────────────────────────────────────────
+CHECKLIST_LOCK  = threading.Lock()
+CHECKLIST_STATE = {}
+
+CHECKLIST_ITEMS = [
+    ("c0", "Preferred session (London/NY)"),
+    ("c1", "HTF bias clear (1H)"),
+    ("c2", "Liquidity sweep happened"),
+    ("c3", "Strong displacement move"),
+    ("c4", "Clean FVG formed"),
+    ("c5", "Price retraces into FVG"),
+    ("c6", "LTF confirmation appears"),
+    ("c7", "Clear liquidity target"),
+]
+
+def grade_setup(state: dict) -> tuple:
+    session_on  = state.get("c0", False)
+    other_keys  = ["c1", "c2", "c3", "c4", "c5", "c6", "c7"]
+    other_count = sum(1 for k in other_keys if state.get(k, False))
+    all_others  = (other_count == 7)
+
+    if all_others and session_on:
+        return "A+", "Perfect setup — TAKE IT", "🔥"
+    elif (all_others and not session_on) or (other_count == 6 and session_on):
+        return "A",  "High quality — strong trade", "✅"
+    elif other_count >= 5:
+        return "B+", "Decent — size down / be cautious", "⚠️"
+    else:
+        return "B",  "Weak setup — SKIP IT", "❌"
+
+def _checklist_header(state: dict) -> str:
+    checked = sum(1 for k, _ in CHECKLIST_ITEMS if state.get(k, False))
+    return f"🔥 *A+ Setup Checklist*\n_Tap to check off each condition ({checked}/8)_\n"
+
+def _checklist_keyboard(state: dict, msg_id: int) -> dict:
+    rows = []
+    for key, label in CHECKLIST_ITEMS:
+        icon = "✅" if state.get(key, False) else "⬜"
+        rows.append([{"text": f"{icon}  {label}",
+                      "callback_data": f"cl_toggle|{msg_id}|{key}"}])
+    rows.append([{"text": "📊  Grade my setup",
+                  "callback_data": f"cl_grade|{msg_id}"}])
+    rows.append([{"text": "🔄  Reset",
+                  "callback_data": f"cl_reset|{msg_id}"}])
+    return {"inline_keyboard": rows}
+
+# ── SYMBOL MAPPING ────────────────────────────────────────────
 YF_SYMBOL_MAP = {
-    # Metals
-    "MGC1!": "GC=F", "GC1!":  "GC=F",       # Gold
-    "SIL1!": "SI=F", "SI1!":  "SI=F",       # Silver
-    "HG1!":  "HG=F",                         # Copper
-    "PL1!":  "PL=F",                         # Platinum
-    # Equity index
-    "MNQ1!": "NQ=F", "NQ1!":  "NQ=F",       # Nasdaq
-    "MES1!": "ES=F", "ES1!":  "ES=F",       # S&P
-    "MYM1!": "YM=F", "YM1!":  "YM=F",       # Dow
-    "M2K1!": "RTY=F", "RTY1!": "RTY=F",     # Russell
-    # Energy
-    "MCL1!": "CL=F", "CL1!":  "CL=F",       # Crude
-    "NG1!":  "NG=F",                         # Natgas
-    # FX / bonds
-    "M6E1!": "6E=F", "6E1!":  "6E=F",
+    "MGC1!": "GC=F",  "GC1!":  "GC=F",
+    "SIL1!": "SI=F",  "SI1!":  "SI=F",
+    "HG1!":  "HG=F",
+    "PL1!":  "PL=F",
+    "MNQ1!": "NQ=F",  "NQ1!":  "NQ=F",
+    "MES1!": "ES=F",  "ES1!":  "ES=F",
+    "MYM1!": "YM=F",  "YM1!":  "YM=F",
+    "M2K1!": "RTY=F", "RTY1!": "RTY=F",
+    "MCL1!": "CL=F",  "CL1!":  "CL=F",
+    "NG1!":  "NG=F",
+    "M6E1!": "6E=F",  "6E1!":  "6E=F",
     "ZB1!":  "ZB=F",
     "ZN1!":  "ZN=F",
 }
 
-# ── STATE (thread-safe) ───────────────────────────────────────
-STATE_LOCK = threading.RLock()
-TRACKING = {}            # trade_id (str) -> full trade record
-UNMAPPED_WARNED = set()  # so we log missing symbols only once
+# ── STATE ─────────────────────────────────────────────────────
+STATE_LOCK      = threading.RLock()
+TRACKING        = {}
+UNMAPPED_WARNED = set()
+LAST_YF_FETCH   = {}   # yf_symbol -> {"ok": bool, "ts": iso, "err": str}
 
 # ── PERSISTENCE ───────────────────────────────────────────────
 def _save_state_unlocked():
-    """Caller must hold STATE_LOCK. Atomic write via temp + replace."""
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
@@ -120,7 +149,6 @@ def save_state():
         _save_state_unlocked()
 
 def load_state():
-    """Load state on startup. Purge resolved trades older than PURGE_DAYS."""
     try:
         if not os.path.exists(STATE_FILE):
             log.info("No state file — starting fresh")
@@ -159,7 +187,7 @@ def validate_signal(sig):
     for f in NUMERIC_FIELDS:
         try:
             v = float(sig[f])
-            if v != v:  # NaN
+            if v != v:
                 return False, f"NaN '{f}'"
         except (TypeError, ValueError):
             return False, f"non-numeric '{f}': {sig[f]!r}"
@@ -181,8 +209,8 @@ def tg_api(method, payload, timeout=5):
         return {}
 
 def signal_buttons(sig):
-    sym = sig.get("symbol", "?")
-    direction = sig.get("signal", "?")
+    sym       = sig.get("symbol", "?")
+    direction = sig.get("signal",  "?")
     return {"inline_keyboard": [
         [{"text": f"✅ Live {direction}", "callback_data": f"confirm|{sym}|{direction}"}],
         [
@@ -190,13 +218,15 @@ def signal_buttons(sig):
             {"text": "⏸ Skip",   "callback_data": f"skip|{sym}|{direction}"},
         ],
         [
-            {"text": "📊 Today",    "callback_data": "today"},
-            {"text": "📈 Outcomes", "callback_data": "outcomes"},
+            {"text": "📊 Today",     "callback_data": "today"},
+            {"text": "📈 Outcomes",  "callback_data": "outcomes"},
+        ],
+        [
+            {"text": "🔥 Checklist", "callback_data": "open_checklist"},
         ],
     ]}
 
 def resolved_buttons():
-    """Buttons shown after user acted or trade resolved."""
     return {"inline_keyboard": [[
         {"text": "📊 Today",    "callback_data": "today"},
         {"text": "📈 Outcomes", "callback_data": "outcomes"},
@@ -205,21 +235,21 @@ def resolved_buttons():
 
 def menu_buttons():
     return {"inline_keyboard": [
-        [{"text": "📊 Today",    "callback_data": "today"},
-         {"text": "📋 Journal",  "callback_data": "journal"}],
-        [{"text": "📈 Outcomes", "callback_data": "outcomes"},
-         {"text": "⏸ Skipped",   "callback_data": "skipped"}],
-        [{"text": "⚙️ Status",   "callback_data": "status"},
-         {"text": "📖 Help",     "callback_data": "help"}],
+        [{"text": "📊 Today",      "callback_data": "today"},
+         {"text": "📋 Journal",    "callback_data": "journal"}],
+        [{"text": "📈 Outcomes",   "callback_data": "outcomes"},
+         {"text": "⏸ Skipped",    "callback_data": "skipped"}],
+        [{"text": "⚙️ Status",    "callback_data": "status"},
+         {"text": "📖 Help",      "callback_data": "help"}],
+        [{"text": "🔥 Checklist", "callback_data": "open_checklist"}],
     ]}
 
 # ── MESSAGE FORMATTERS ────────────────────────────────────────
 def format_signal_body(sig, ana=None):
-    """The shared body — fast alert if ana is None, enriched if ana present."""
     dir_emoji = "📈" if sig.get("signal") == "LONG" else "📉"
-    cct_txt = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
-    icc_txt = "✓" if sig.get("icc") else "—"
-    fvg_txt = "✓" if sig.get("fvg") else "—"
+    cct_txt   = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
+    icc_txt   = "✓" if sig.get("icc") else "—"
+    fvg_txt   = "✓" if sig.get("fvg") else "—"
 
     body = (
         f"{dir_emoji} *{sig.get('symbol')} — {sig.get('signal')}*"
@@ -239,7 +269,7 @@ def format_signal_body(sig, ana=None):
     )
 
     if ana:
-        v = ana.get("verdict", "REVIEW")
+        v       = ana.get("verdict", "REVIEW")
         v_emoji = {"BUY": "✅", "SELL": "✅", "WAIT": "⏸", "REVIEW": "⚠️"}.get(v, "•")
         body += (f"\n{v_emoji} *Claude: {v}* ({ana.get('confidence')})\n"
                  f"_{ana.get('key_factor', '')}_\n\n"
@@ -277,7 +307,6 @@ def format_outcome_footer(trade):
             f"MFE: `{mfe:+.2f}`  |  MAE: `{mae:+.2f}`")
 
 def render_trade(trade):
-    """Single source of truth for message content. Builds from trade state."""
     return (format_signal_body(trade["sig"], trade.get("ana"))
             + format_mode_stamp(trade)
             + format_outcome_footer(trade))
@@ -307,9 +336,9 @@ def send_text(text, buttons=None):
     resp = tg_api("sendMessage", payload)
     return resp.get("result", {}).get("message_id", 0)
 
-def edit_message(message_id, new_text, buttons=None):
+def edit_message(message_id, new_text, buttons=None, parse_mode="Markdown"):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id,
-               "text": new_text, "parse_mode": "Markdown"}
+               "text": new_text, "parse_mode": parse_mode}
     if buttons is not None:
         payload["reply_markup"] = buttons
     tg_api("editMessageText", payload)
@@ -358,7 +387,6 @@ Return ONLY valid JSON:
             text = text.strip().rstrip("`").strip()
         return json.loads(text)
     except requests.exceptions.Timeout:
-        log.warning(f"Claude timeout after {CLAUDE_TIMEOUT}s")
         return {"verdict": "REVIEW", "confidence": "N/A",
                 "key_factor": "Claude timed out",
                 "reasoning": "Trade on your own read."}
@@ -370,21 +398,18 @@ Return ONLY valid JSON:
 
 # ── SIGNAL PROCESSING ─────────────────────────────────────────
 def process_signal_async(sig):
-    """Fast alert → record → Claude → enrich. Runs in a thread."""
     try:
         ok, reason = validate_signal(sig)
         if not ok:
-            log.error(f"Signal rejected: {reason} | {json.dumps(sig)[:200]}")
+            log.error(f"Signal rejected: {reason}")
             return
 
         msg_id = send_fast_alert(sig)
         if not msg_id:
-            log.error("Fast alert failed — aborting")
             return
-        log.info(f"Fast alert sent, message_id={msg_id}")
 
         trade_id = str(msg_id)
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso  = datetime.now(timezone.utc).isoformat()
         with STATE_LOCK:
             TRACKING[trade_id] = {
                 "trade_id":     trade_id,
@@ -404,40 +429,53 @@ def process_signal_async(sig):
             _save_state_unlocked()
 
         ana = analyze(sig)
-        log.info(f"Claude: {ana.get('verdict')} ({ana.get('confidence')})")
 
         with STATE_LOCK:
             t = TRACKING.get(trade_id)
             if not t:
                 return
-            t["ana"] = ana
+            t["ana"]   = ana
             trade_copy = deepcopy(t)
             _save_state_unlocked()
 
         edit_message(msg_id, render_trade(trade_copy), buttons_for_trade(trade_copy))
-        log.info(f"Message {msg_id} enriched")
     except Exception as e:
         log.exception(f"process_signal_async error: {e}")
 
 # ── OUTCOME TRACKER ───────────────────────────────────────────
 def _fetch_history(yf_symbol):
-    """Fetch recent 1m bars. Returns DataFrame or None on any failure."""
+    """Fetch and record success/failure for /debug visibility."""
     try:
-        t = yf.Ticker(yf_symbol)
+        t    = yf.Ticker(yf_symbol)
         hist = t.history(period="2d", interval="1m", auto_adjust=False)
         if hist is None or hist.empty:
+            LAST_YF_FETCH[yf_symbol] = {
+                "ok": False,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "err": "empty result"
+            }
             return None
         if hist.index.tz is None:
             hist.index = hist.index.tz_localize("UTC")
         else:
             hist.index = hist.index.tz_convert("UTC")
+        LAST_YF_FETCH[yf_symbol] = {
+            "ok": True,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "bars": len(hist),
+        }
         return hist
     except Exception as e:
+        LAST_YF_FETCH[yf_symbol] = {
+            "ok": False,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "err": str(e)[:200],
+        }
         log.warning(f"yfinance fetch failed for {yf_symbol}: {e}")
         return None
 
-def _check_trade(trade, hist):
-    """Update trade in place. Returns True if newly resolved this call."""
+def _check_trade_against_hist(trade, hist):
+    """Check trade against price history. Returns True if newly resolved."""
     sig = trade["sig"]
     try:
         entry_ts = pd.Timestamp(trade["entry_time"])
@@ -445,18 +483,17 @@ def _check_trade(trade, hist):
             entry_ts = entry_ts.tz_localize("UTC")
         else:
             entry_ts = entry_ts.tz_convert("UTC")
-    except Exception as e:
-        log.warning(f"Bad entry_time on {trade.get('trade_id')}: {e}")
+    except Exception:
         return False
 
-    post = hist[hist.index > entry_ts]
+    post      = hist[hist.index > entry_ts]
     direction = sig["signal"]
-    entry = float(sig["price"])
-    stop  = float(sig["stop"])
-    tp1   = float(sig["target1"])
-    tp2   = float(sig["target2"])
-    mfe = float(trade.get("mfe", 0) or 0)
-    mae = float(trade.get("mae", 0) or 0)
+    entry     = float(sig["price"])
+    stop      = float(sig["stop"])
+    tp1       = float(sig["target1"])
+    tp2       = float(sig["target2"])
+    mfe       = float(trade.get("mfe", 0) or 0)
+    mae       = float(trade.get("mae", 0) or 0)
 
     resolved, resolved_time = None, None
 
@@ -473,65 +510,109 @@ def _check_trade(trade, hist):
             if lo <= stop:
                 resolved, resolved_time = "STOP", idx; break
             if hi >= tp2:
-                resolved, resolved_time = "TP2", idx; break
+                resolved, resolved_time = "TP2",  idx; break
             if hi >= tp1 and not trade.get("tp1_hit_time"):
                 trade["tp1_hit_time"] = idx.isoformat()
-        else:  # SHORT
+        else:
             mfe = max(mfe, entry - lo)
             mae = min(mae, entry - hi)
             if hi >= stop:
                 resolved, resolved_time = "STOP", idx; break
             if lo <= tp2:
-                resolved, resolved_time = "TP2", idx; break
+                resolved, resolved_time = "TP2",  idx; break
             if lo <= tp1 and not trade.get("tp1_hit_time"):
                 trade["tp1_hit_time"] = idx.isoformat()
 
-    trade["mfe"] = round(mfe, 4)
-    trade["mae"] = round(mae, 4)
+    trade["mfe"]          = round(mfe, 4)
+    trade["mae"]          = round(mae, 4)
     trade["last_checked"] = datetime.now(timezone.utc).isoformat()
 
     if resolved:
-        trade["result"] = resolved
+        trade["result"]      = resolved
         trade["result_time"] = (resolved_time.isoformat()
                                 if hasattr(resolved_time, "isoformat")
                                 else str(resolved_time))
         return True
+    return False
 
-    # Timeout check
-    age = datetime.now(timezone.utc) - entry_ts.to_pydatetime()
-    if age > timedelta(hours=TRADE_TIMEOUT_HRS):
-        if trade.get("tp1_hit_time"):
-            trade["result"] = "TP1"
-            trade["result_time"] = trade["tp1_hit_time"]
+def _check_timeout(trade):
+    """Pure age check — no yfinance dependency. Returns True if timed out."""
+    try:
+        entry_ts = pd.Timestamp(trade["entry_time"]) if OUTCOME_TRACKING_AVAILABLE \
+                   else datetime.fromisoformat(trade["entry_time"])
+        if hasattr(entry_ts, "tz") and entry_ts.tz is None:
+            entry_ts = entry_ts.tz_localize("UTC")
+        elif hasattr(entry_ts, "tz"):
+            entry_ts = entry_ts.tz_convert("UTC")
+
+        if hasattr(entry_ts, "to_pydatetime"):
+            entry_dt = entry_ts.to_pydatetime()
         else:
-            trade["result"] = "TIMEOUT"
-            trade["result_time"] = datetime.now(timezone.utc).isoformat()
-        return True
+            entry_dt = entry_ts
+
+        age = datetime.now(timezone.utc) - entry_dt
+        if age > timedelta(hours=TRADE_TIMEOUT_HRS):
+            if trade.get("tp1_hit_time"):
+                trade["result"]      = "TP1"
+                trade["result_time"] = trade["tp1_hit_time"]
+            else:
+                trade["result"]      = "TIMEOUT"
+                trade["result_time"] = datetime.now(timezone.utc).isoformat()
+            return True
+    except Exception as e:
+        log.warning(f"Timeout check failed for {trade.get('trade_id')}: {e}")
     return False
 
 def _outcome_tick():
+    """
+    NEW v5.2 ORDER:
+    1. Check timeouts on EVERY active trade (no yfinance needed)
+    2. Then attempt yfinance TP/STOP detection on remaining open trades
+    """
+    # ── PHASE 1: Timeout check (always runs, no yfinance) ─────
+    with STATE_LOCK:
+        active_ids = [tid for tid, t in TRACKING.items() if t.get("result") is None]
+
+    timeout_resolved = []
+    if active_ids:
+        with STATE_LOCK:
+            for tid in active_ids:
+                t = TRACKING.get(tid)
+                if not t or t.get("result") is not None:
+                    continue
+                if _check_timeout(t):
+                    timeout_resolved.append(deepcopy(t))
+            if timeout_resolved:
+                _save_state_unlocked()
+
+    # Edit Telegram messages for timeouts (outside lock)
+    for t in timeout_resolved:
+        try:
+            edit_message(t["message_id"], render_trade(t), resolved_buttons())
+            log.info(f"Trade {t['trade_id']} timed out: {t['result']}")
+        except Exception as e:
+            log.error(f"Timeout edit failed for {t.get('trade_id')}: {e}")
+
+    # ── PHASE 2: yfinance TP/STOP detection (best effort) ─────
     if not OUTCOME_TRACKING_AVAILABLE:
         return
 
     with STATE_LOCK:
         active_ids = [tid for tid, t in TRACKING.items() if t.get("result") is None]
-
     if not active_ids:
         return
 
-    # Group by yfinance symbol so we fetch each once
     by_yf = {}
     with STATE_LOCK:
         for tid in active_ids:
-            t = TRACKING.get(tid)
+            t  = TRACKING.get(tid)
             if not t:
                 continue
-            tv = t["sig"].get("symbol")
+            tv  = t["sig"].get("symbol")
             yfs = YF_SYMBOL_MAP.get(tv)
             if not yfs:
                 if tv not in UNMAPPED_WARNED:
-                    log.warning(f"No yfinance mapping for '{tv}' — add to YF_SYMBOL_MAP "
-                                f"for outcome tracking. Trade still logged.")
+                    log.warning(f"No yfinance mapping for '{tv}'.")
                     UNMAPPED_WARNED.add(tv)
                 continue
             by_yf.setdefault(yfs, []).append(tid)
@@ -539,22 +620,21 @@ def _outcome_tick():
     if not by_yf:
         return
 
-    # Fetch outside the lock
     hist_cache = {yfs: _fetch_history(yfs) for yfs in by_yf}
 
     for yfs, tids in by_yf.items():
         hist = hist_cache.get(yfs)
         if hist is None:
-            continue
+            continue   # yfinance failed for this symbol — timeouts already handled
         for tid in tids:
-            trade_copy = None
+            trade_copy     = None
             newly_resolved = False
             try:
                 with STATE_LOCK:
                     t = TRACKING.get(tid)
                     if not t or t.get("result") is not None:
                         continue
-                    newly_resolved = _check_trade(t, hist)
+                    newly_resolved = _check_trade_against_hist(t, hist)
                     if newly_resolved:
                         trade_copy = deepcopy(t)
                         _save_state_unlocked()
@@ -573,7 +653,7 @@ def _outcome_tick():
 
 def outcome_tracker_loop():
     log.info(f"Outcome tracker running (every {OUTCOME_POLL_SEC}s, "
-             f"timeout {TRADE_TIMEOUT_HRS}h)")
+             f"timeout {TRADE_TIMEOUT_HRS}h, timeout-first)")
     while True:
         try:
             _outcome_tick()
@@ -587,8 +667,8 @@ def _all_trades():
         return [deepcopy(t) for t in TRACKING.values()]
 
 def today_stats():
-    today = datetime.now(timezone.utc).date()
-    all_t = _all_trades()
+    today   = datetime.now(timezone.utc).date()
+    all_t   = _all_trades()
     today_t = []
     for t in all_t:
         try:
@@ -604,11 +684,11 @@ def today_stats():
     pend   = [t for t in today_t if t["mode"] == "pending"]
     wins   = sum(1 for t in today_t if t.get("result") in ("TP1", "TP2"))
     losses = sum(1 for t in today_t if t.get("result") == "STOP")
-    lines = [f"*📊 Today* ({today.isoformat()})\n",
-             f"✅ Live:    {len(live)}",
-             f"📝 Paper:   {len(paper)}",
-             f"⏸ Skipped: {len(skip)}",
-             f"⏳ Pending: {len(pend)}"]
+    lines  = [f"*📊 Today* ({today.isoformat()})\n",
+              f"✅ Live:    {len(live)}",
+              f"📝 Paper:   {len(paper)}",
+              f"⏸ Skipped: {len(skip)}",
+              f"⏳ Pending: {len(pend)}"]
     if wins + losses:
         wr = wins / (wins + losses) * 100
         lines.append(f"\n*Resolved:* {wins}W / {losses}L ({wr:.0f}%)")
@@ -621,13 +701,13 @@ def recent_journal():
     trades.sort(key=lambda t: t.get("entry_time", ""), reverse=True)
     lines = ["*📋 Recent confirmed* (last 10)\n"]
     for t in trades[:10]:
-        s = t["sig"]
+        s  = t["sig"]
         try:
             ts = datetime.fromisoformat(t["entry_time"]).strftime("%m/%d %H:%M")
         except Exception:
             ts = "??"
         me = "✅" if t["mode"] == "live" else "📝"
-        r = t.get("result") or "open"
+        r  = t.get("result") or "open"
         lines.append(f"{me} `{ts}` {s.get('symbol')} *{s.get('signal')}* "
                      f"@ {s.get('price')} → {r}")
     return "\n".join(lines)
@@ -639,18 +719,18 @@ def recent_skipped():
     trades.sort(key=lambda t: t.get("entry_time", ""), reverse=True)
     lines = ["*⏸ Recent skipped* (would-be outcomes tracked)\n"]
     for t in trades[:10]:
-        s = t["sig"]
+        s  = t["sig"]
         try:
             ts = datetime.fromisoformat(t["entry_time"]).strftime("%m/%d %H:%M")
         except Exception:
             ts = "??"
-        r = t.get("result") or "open"
+        r  = t.get("result") or "open"
         lines.append(f"⏸ `{ts}` {s.get('symbol')} *{s.get('signal')}* "
                      f"@ {s.get('price')} → would-be: *{r}*")
     return "\n".join(lines)
 
 def outcomes_summary():
-    trades = _all_trades()
+    trades   = _all_trades()
     resolved = [t for t in trades if t.get("result") in ("TP1", "TP2", "STOP", "TIMEOUT")]
     if not resolved:
         return "*📈 Outcomes*\n\nNo resolved trades yet."
@@ -680,56 +760,103 @@ def outcomes_summary():
     return "\n".join(lines)
 
 def help_text():
+    session_info = (f"`{', '.join(ALLOWED_SESSIONS)}`"
+                    if FILTER_SESSIONS else "OFF — all sessions pass through")
     return (
-        "*📖 Kronus AI v5 — Help*\n\n"
+        "*📖 Kronus AI v5.2 — Help*\n\n"
         "Alert fires in ~3s. Claude verdict updates it a few seconds later.\n\n"
-        "*Actions on each signal:*\n"
-        "• ✅ *Live* — real trade, logged & outcome tracked\n"
-        "• 📝 *Paper* — practice trade, logged & tracked\n"
-        "• ⏸ *Skip* — pass, but *outcome still tracked* (see what you missed)\n\n"
-        "Every signal is auto-tracked for TP1 / TP2 / STOP / TIMEOUT regardless of "
-        "your action. This builds the dataset for Phase 2 (broker auto-execution). "
-        "MFE / MAE recorded too.\n\n"
-        "*Commands:* `/menu` `/today` `/journal` `/skipped` `/outcomes` `/status` `/help`"
+        "*Actions:*\n"
+        "• ✅ *Live* — real trade, logged & tracked\n"
+        "• 📝 *Paper* — simulated, fully tracked\n"
+        "• ⏸ *Skip* — pass, but tracked anyway\n\n"
+        f"*Timeout:* {TRADE_TIMEOUT_HRS}h. Trades that don't hit TP/STOP "
+        f"resolve to TIMEOUT regardless of yfinance status.\n\n"
+        f"*Session filter:* {session_info}\n\n"
+        "*Commands:* `/menu` `/checklist` `/today` `/journal` `/skipped` `/outcomes` `/status` `/debug` `/help`"
     )
 
 def status_text():
     with STATE_LOCK:
-        n = len(TRACKING)
+        n      = len(TRACKING)
         counts = {"pending": 0, "live": 0, "paper": 0, "skipped": 0}
-        open_ = 0
+        open_  = 0
         for t in TRACKING.values():
             counts[t.get("mode", "pending")] = counts.get(t.get("mode", "pending"), 0) + 1
             if t.get("result") is None:
                 open_ += 1
-    tracker = ("✅ yfinance" if OUTCOME_TRACKING_AVAILABLE
-               else "❌ install yfinance+pandas")
+    tracker      = ("✅ yfinance" if OUTCOME_TRACKING_AVAILABLE else "❌")
+    session_line = (f"✅ ON → `{', '.join(ALLOWED_SESSIONS)}`"
+                    if FILTER_SESSIONS else "⛔ OFF")
     return (
         "*⚙️ Kronus AI — Status*\n\n"
-        f"Version: *v5 (outcomes + paper)*\n"
+        f"Version: *v5.2 (timeout fix)*\n"
         f"Claude: {'✅ ' + CLAUDE_MODEL if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else '❌'}\n"
         f"Telegram: {'✅' if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else '❌'}\n"
         f"Tracker: {tracker}\n"
-        f"Poll: {OUTCOME_POLL_SEC}s | Timeout: {TRADE_TIMEOUT_HRS}h | State: `{STATE_FILE}`\n\n"
+        f"Session filter: {session_line}\n"
+        f"Poll: {OUTCOME_POLL_SEC}s | Timeout: {TRADE_TIMEOUT_HRS}h\n\n"
         f"Total: *{n}*  |  Open: *{open_}*\n"
         f"Live: {counts['live']}  |  Paper: {counts['paper']}  |  "
         f"Skip: {counts['skipped']}  |  Pending: {counts['pending']}"
     )
 
+def debug_text():
+    """Show every open trade's age + last yfinance fetch status."""
+    now = datetime.now(timezone.utc)
+    with STATE_LOCK:
+        open_trades = [deepcopy(t) for t in TRACKING.values() if t.get("result") is None]
+
+    lines = ["*🐛 Debug — open trades*\n"]
+
+    if not open_trades:
+        lines.append("_No open trades._")
+    else:
+        for t in open_trades[:15]:
+            s = t["sig"]
+            try:
+                entry = datetime.fromisoformat(t["entry_time"])
+                age_hrs = (now - entry).total_seconds() / 3600
+                age_str = f"{age_hrs:.1f}h"
+            except Exception:
+                age_str = "?"
+            yfs = YF_SYMBOL_MAP.get(s.get("symbol"), "❌ unmapped")
+            lines.append(f"• `{s.get('symbol')}` {s.get('signal')} "
+                         f"({t.get('mode')}) — age {age_str} → yf=`{yfs}`")
+
+    lines.append("\n*Last yfinance fetches:*")
+    if not LAST_YF_FETCH:
+        lines.append("_No fetches yet — tracker may not be running._")
+    else:
+        for sym, info in LAST_YF_FETCH.items():
+            ok = "✅" if info.get("ok") else "❌"
+            try:
+                ago = (now - datetime.fromisoformat(info["ts"])).total_seconds() / 60
+                ago_str = f"{ago:.0f}m ago"
+            except Exception:
+                ago_str = "?"
+            extra = f" ({info.get('err')})" if not info.get("ok") else f" ({info.get('bars')} bars)"
+            lines.append(f"{ok} `{sym}` — {ago_str}{extra}")
+
+    return "\n".join(lines)
+
 # ── ROUTES ────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
     with STATE_LOCK:
-        n = len(TRACKING)
+        n     = len(TRACKING)
         open_ = sum(1 for t in TRACKING.values() if t.get("result") is None)
     return jsonify({
-        "status": "running",
-        "bot": "Kronus AI v5 (outcomes + paper mode)",
-        "claude": "enabled" if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else "disabled",
-        "claude_model": CLAUDE_MODEL,
-        "telegram": "enabled" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
-        "outcome_tracker": OUTCOME_TRACKING_AVAILABLE,
-        "tracked": n, "open": open_,
+        "status":           "running",
+        "bot":              "Kronus AI v5.2 (timeout fix)",
+        "claude":           "enabled" if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else "disabled",
+        "claude_model":     CLAUDE_MODEL,
+        "telegram":         "enabled" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
+        "outcome_tracker":  OUTCOME_TRACKING_AVAILABLE,
+        "session_filter":   FILTER_SESSIONS,
+        "allowed_sessions": ALLOWED_SESSIONS if FILTER_SESSIONS else "all",
+        "tracked":          n,
+        "open":             open_,
+        "yf_status":        LAST_YF_FETCH,
     })
 
 @app.route("/webhook", methods=["POST"])
@@ -739,22 +866,28 @@ def webhook():
         log.info(f"Webhook in: {raw[:250]}")
         sig = json.loads(raw)
     except Exception as e:
-        log.error(f"JSON parse: {e}")
         return jsonify({"error": "invalid JSON"}), 400
+
     if sig.get("secret") != WEBHOOK_SECRET:
-        log.warning("Invalid secret")
         return jsonify({"error": "unauthorized"}), 401
+
+    if FILTER_SESSIONS:
+        sig_session = str(sig.get("session", "")).strip().upper()
+        if sig_session and sig_session not in ALLOWED_SESSIONS:
+            log.info(f"Signal blocked — session '{sig_session}'")
+            return jsonify({"status": "skipped",
+                            "reason": f"session '{sig_session}' filtered"}), 200
+
     ok, reason = validate_signal(sig)
     if not ok:
-        log.warning(f"Invalid signal: {reason}")
         return jsonify({"error": f"bad signal: {reason}"}), 400
+
     threading.Thread(target=process_signal_async, args=(sig,), daemon=True).start()
     return jsonify({"status": "accepted"}), 200
 
 @app.route("/telegram", methods=["POST"])
 def telegram_update():
     upd = request.get_json(silent=True) or {}
-    log.info(f"TG update: {json.dumps(upd)[:300]}")
 
     if "callback_query" in upd:
         cb     = upd["callback_query"]
@@ -762,20 +895,78 @@ def telegram_update():
         data   = cb.get("data", "")
         msg    = cb.get("message", {})
         msg_id = msg.get("message_id", 0)
-        action = data.split("|")[0]
+        parts  = data.split("|")
+        action = parts[0]
         trade_id = str(msg_id)
 
+        if action == "open_checklist":
+            answer_callback(cb_id)
+            result = tg_api("sendMessage", {
+                "chat_id":      TELEGRAM_CHAT_ID,
+                "text":         _checklist_header({}),
+                "parse_mode":   "Markdown",
+                "reply_markup": _checklist_keyboard({}, 0),
+            })
+            new_id = result.get("result", {}).get("message_id", 0)
+            if new_id:
+                with CHECKLIST_LOCK:
+                    CHECKLIST_STATE[new_id] = {}
+                edit_message(new_id, _checklist_header({}),
+                             _checklist_keyboard({}, new_id))
+            return jsonify({"ok": True})
+
+        if action == "cl_toggle" and len(parts) == 3:
+            ref_id   = int(parts[1])
+            item_key = parts[2]
+            with CHECKLIST_LOCK:
+                state              = CHECKLIST_STATE.get(ref_id, {})
+                state[item_key]    = not state.get(item_key, False)
+                CHECKLIST_STATE[ref_id] = state
+                state_copy         = dict(state)
+            edit_message(msg_id, _checklist_header(state_copy),
+                         _checklist_keyboard(state_copy, ref_id))
+            answer_callback(cb_id)
+            return jsonify({"ok": True})
+
+        if action == "cl_grade" and len(parts) == 2:
+            ref_id = int(parts[1])
+            with CHECKLIST_LOCK:
+                state = dict(CHECKLIST_STATE.get(ref_id, {}))
+            tier, label, emoji = grade_setup(state)
+            checked     = sum(1 for k, _ in CHECKLIST_ITEMS if state.get(k, False))
+            missing     = [lbl for k, lbl in CHECKLIST_ITEMS if not state.get(k, False)]
+            missing_str = "\n".join(f"  ⬜ {m}" for m in missing) if missing else "  ✅ All conditions met!"
+            answer_callback(cb_id, f"{emoji} {tier} — {label}")
+            send_text(
+                f"{emoji} *Setup Grade: {tier}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"*{label}*\n"
+                f"Conditions met: *{checked}/8*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"*Missing:*\n{missing_str}",
+                menu_buttons()
+            )
+            return jsonify({"ok": True})
+
+        if action == "cl_reset" and len(parts) == 2:
+            ref_id = int(parts[1])
+            with CHECKLIST_LOCK:
+                CHECKLIST_STATE[ref_id] = {}
+            edit_message(msg_id, _checklist_header({}),
+                         _checklist_keyboard({}, ref_id))
+            answer_callback(cb_id, "Reset!")
+            return jsonify({"ok": True})
+
         def set_mode(new_mode, short_msg):
-            """Atomically set mode (once) and re-render the message."""
             with STATE_LOCK:
                 t = TRACKING.get(trade_id)
                 if not t:
                     return None, "missing"
                 if t.get("mode") != "pending":
                     return None, "already_acted"
-                t["mode"] = new_mode
+                t["mode"]        = new_mode
                 t["action_time"] = datetime.now(timezone.utc).isoformat()
-                trade_copy = deepcopy(t)
+                trade_copy       = deepcopy(t)
                 _save_state_unlocked()
             answer_callback(cb_id, short_msg)
             try:
@@ -814,13 +1005,30 @@ def telegram_update():
 
     if "message" in upd:
         text = upd["message"].get("text", "").strip().lower()
+
         if text in ("/menu", "/start"):
             send_text("*📊 Kronus AI — Main Menu*\n\nPick an option:", menu_buttons())
+
+        elif text == "/checklist":
+            result = tg_api("sendMessage", {
+                "chat_id":      TELEGRAM_CHAT_ID,
+                "text":         _checklist_header({}),
+                "parse_mode":   "Markdown",
+                "reply_markup": _checklist_keyboard({}, 0),
+            })
+            new_id = result.get("result", {}).get("message_id", 0)
+            if new_id:
+                with CHECKLIST_LOCK:
+                    CHECKLIST_STATE[new_id] = {}
+                edit_message(new_id, _checklist_header({}),
+                             _checklist_keyboard({}, new_id))
+
         elif text == "/today":    send_text(today_stats(),      menu_buttons())
         elif text == "/journal":  send_text(recent_journal(),   menu_buttons())
         elif text == "/skipped":  send_text(recent_skipped(),   menu_buttons())
         elif text == "/outcomes": send_text(outcomes_summary(), menu_buttons())
         elif text == "/status":   send_text(status_text(),      menu_buttons())
+        elif text == "/debug":    send_text(debug_text(),       menu_buttons())
         elif text == "/help":     send_text(help_text(),        menu_buttons())
         return jsonify({"ok": True})
 
@@ -828,10 +1036,38 @@ def telegram_update():
 
 @app.route("/outcomes", methods=["GET"])
 def outcomes_json():
-    """Dump full state as JSON for external analysis / CSV export."""
     with STATE_LOCK:
         return jsonify({"count": len(TRACKING),
                         "trades": list(TRACKING.values())})
+
+@app.route("/debug", methods=["GET"])
+def debug_json():
+    """Web version of /debug command for browser inspection."""
+    now = datetime.now(timezone.utc)
+    with STATE_LOCK:
+        trades = []
+        for t in TRACKING.values():
+            if t.get("result") is not None:
+                continue
+            try:
+                entry   = datetime.fromisoformat(t["entry_time"])
+                age_hrs = round((now - entry).total_seconds() / 3600, 2)
+            except Exception:
+                age_hrs = None
+            trades.append({
+                "trade_id":  t["trade_id"],
+                "symbol":    t["sig"].get("symbol"),
+                "yf_symbol": YF_SYMBOL_MAP.get(t["sig"].get("symbol"), None),
+                "mode":      t.get("mode"),
+                "age_hrs":   age_hrs,
+                "tp1_hit":   t.get("tp1_hit_time") is not None,
+            })
+    return jsonify({
+        "open_trades":    trades,
+        "yf_last_fetch":  LAST_YF_FETCH,
+        "timeout_hrs":    TRADE_TIMEOUT_HRS,
+        "poll_sec":       OUTCOME_POLL_SEC,
+    })
 
 @app.route("/setup_telegram", methods=["GET"])
 def setup_telegram():
@@ -840,8 +1076,8 @@ def setup_telegram():
     if not PUBLIC_URL:
         return jsonify({"error": "PUBLIC_URL env var not set"}), 400
     target = f"{PUBLIC_URL.rstrip('/')}/telegram"
-    resp = tg_api("setWebhook", {"url": target,
-                                 "allowed_updates": ["message", "callback_query"]})
+    resp   = tg_api("setWebhook", {"url": target,
+                                   "allowed_updates": ["message", "callback_query"]})
     return jsonify({"target": target, "telegram_response": resp})
 
 @app.route("/ping", methods=["GET"])
@@ -865,11 +1101,9 @@ def test():
 load_state()
 if OUTCOME_TRACKING_AVAILABLE:
     threading.Thread(target=outcome_tracker_loop, daemon=True).start()
-else:
-    log.warning("Outcome tracker NOT started (yfinance missing). "
-                "Signals still logged; outcomes will stay 'open'.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    log.info(f"Kronus AI v5 starting on port {port}")
+    log.info(f"Kronus AI v5.2 starting on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
+    
