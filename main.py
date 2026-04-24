@@ -1,15 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  KRONUS AI — MAIN SERVER  (v5.3 — checklist auto-fill)      ║
+║  KRONUS AI — MAIN SERVER  (v5.4 — Pine v9 compatible)       ║
 ║                                                              ║
-║  NEW vs v5.2:                                                ║
-║   • autofill_checklist(sig) — reads the 7 condition         ║
-║     booleans sent by Pine v8 and pre-fills the checklist.   ║
-║     Every signal now auto-sends a filled checklist below    ║
-║     the trade alert. Still fully tap-to-toggle.             ║
-║   • /checklist command pre-fills from most recent signal.   ║
-║   • Checklist button on signal card pre-fills from that     ║
-║     card's own trade signal.                                 ║
+║  CHANGES vs v5.3:                                            ║
+║   • RVOL displayed on every Telegram signal card.            ║
+║   • Conditions shown as X/max_conditions (not hardcoded /7) ║
+║     so future Pine changes never create "8/7" displays.     ║
+║   • C3 checklist label updated: "Strong displacement +       ║
+║     volume (≥1.3× avg)" — matches Pine v9 definition.       ║
+║   • Claude prompt updated: describes pivot-anchored sweep,   ║
+║     volume-gated displacement, and tight FVG retrace so      ║
+║     Claude's analysis reflects the actual signal quality.    ║
+║   • /test route includes rvol field matching Pine v9.        ║
+║   • Version strings updated throughout.                      ║
+║                                                              ║
+║  v5.3 PRESERVED:                                             ║
+║   autofill_checklist from Pine booleans | /checklist command ║
+║   Checklist button auto-fills from originating signal card   ║
+║   Outcome tracker (yfinance TP/STOP + timeout fallback)      ║
+║   State persistence | Session filtering | Claude analysis    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 import os
@@ -65,15 +74,16 @@ ALLOWED_SESSIONS = [
 CHECKLIST_LOCK  = threading.Lock()
 CHECKLIST_STATE = {}
 
+# C3 label updated to reflect Pine v9: displacement now requires volume
 CHECKLIST_ITEMS = [
     ("c0", "Preferred session (London/NY)"),
-    ("c1", "HTF bias clear (1H)"),
-    ("c2", "Liquidity sweep happened"),
-    ("c3", "Strong displacement move"),
+    ("c1", "HTF bias clear (2+ of 3 TFs aligned)"),
+    ("c2", "Liquidity sweep at confirmed pivot"),
+    ("c3", "Strong displacement + volume (≥1.3× avg)"),
     ("c4", "Clean FVG formed"),
-    ("c5", "Price retraces into FVG"),
-    ("c6", "LTF confirmation appears"),
-    ("c7", "Clear liquidity target"),
+    ("c5", "Price retraces into FVG (wick tap, close respects)"),
+    ("c6", "LTF Strat confirmation (combo fired)"),
+    ("c7", "Clear liquidity target ahead"),
 ]
 
 def grade_setup(state: dict) -> tuple:
@@ -91,20 +101,21 @@ def grade_setup(state: dict) -> tuple:
     else:
         return "B",  "Weak setup — SKIP IT", "❌"
 
-# ── NEW: AUTO-FILL CHECKLIST FROM PINE v8 SIGNAL ─────────────
+# ── AUTO-FILL CHECKLIST FROM PINE v9 SIGNAL ──────────────────
 def autofill_checklist(sig: dict) -> dict:
     """
-    Reads the 7 condition booleans Pine v8 sends in the webhook
-    and returns a pre-filled checklist state dict.
-    All items are still tap-to-toggle after auto-fill.
+    Reads the 7 condition booleans Pine v9 sends and pre-fills the checklist.
+    cond_displacement is now True only when both ICC body AND volume confirmed,
+    matching c3 = "Strong displacement + volume (≥1.3× avg)".
+    All items remain tap-to-toggle after auto-fill.
     """
     return {
         "c0": sig.get("in_preferred_sess", False),
         "c1": sig.get("cond_htf_bias",     False),
-        "c2": sig.get("cond_liq_sweep",     False),
-        "c3": sig.get("cond_displacement",  False),
+        "c2": sig.get("cond_liq_sweep",     False),   # pivot-anchored in v9
+        "c3": sig.get("cond_displacement",  False),   # body + volume in v9
         "c4": sig.get("cond_fvg_formed",    False),
-        "c5": sig.get("cond_fvg_retrace",   False),
+        "c5": sig.get("cond_fvg_retrace",   False),   # tight (tap+respect) in v9
         "c6": sig.get("cond_ltf_confirm",   False),
         "c7": sig.get("cond_liq_target",    False),
         "_autofilled": True,
@@ -171,9 +182,9 @@ def load_state():
             return
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
-        loaded = data.get("tracking", {}) or {}
-        cutoff = datetime.now(timezone.utc) - timedelta(days=PURGE_DAYS)
-        kept = {}
+        loaded  = data.get("tracking", {}) or {}
+        cutoff  = datetime.now(timezone.utc) - timedelta(days=PURGE_DAYS)
+        kept    = {}
         for tid, t in loaded.items():
             rt = t.get("result_time")
             if rt:
@@ -216,8 +227,9 @@ def tg_api(method, payload, timeout=5):
     if not TELEGRAM_TOKEN:
         return {}
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
-                          json=payload, timeout=timeout)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}",
+            json=payload, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -234,12 +246,10 @@ def signal_buttons(sig):
             {"text": "⏸ Skip",   "callback_data": f"skip|{sym}|{direction}"},
         ],
         [
-            {"text": "📊 Today",     "callback_data": "today"},
-            {"text": "📈 Outcomes",  "callback_data": "outcomes"},
+            {"text": "📊 Today",    "callback_data": "today"},
+            {"text": "📈 Outcomes", "callback_data": "outcomes"},
         ],
-        [
-            {"text": "🔥 Checklist", "callback_data": "open_checklist"},
-        ],
+        [{"text": "🔥 Checklist", "callback_data": "open_checklist"}],
     ]}
 
 def resolved_buttons():
@@ -262,24 +272,48 @@ def menu_buttons():
 
 # ── MESSAGE FORMATTERS ────────────────────────────────────────
 def format_signal_body(sig, ana=None):
-    dir_emoji = "📈" if sig.get("signal") == "LONG" else "📉"
-    cct_txt   = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
-    icc_txt   = "✓" if sig.get("cond_displacement") or sig.get("icc") else "—"
-    fvg_txt   = "✓" if sig.get("cond_fvg_formed")   or sig.get("fvg") else "—"
-    conds     = sig.get("conditions_met", sig.get("score", "?"))
+    """
+    Renders the Telegram signal card.
+    Uses max_conditions from payload so the counter never shows wrong totals
+    when Pine changes the condition count.
+    RVOL is displayed on every card — volume is now part of C3 in Pine v9.
+    """
+    dir_emoji  = "📈" if sig.get("signal") == "LONG" else "📉"
+    max_c      = sig.get("max_conditions", 7)
+    conds      = sig.get("conditions_met", sig.get("score", "?"))
+    cct_txt    = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
+    icc_txt    = "✓" if sig.get("cond_displacement") else "—"
+    fvg_txt    = "✓" if sig.get("cond_fvg_formed")   else "—"
+    sweep_txt  = "✓ pivot" if sig.get("cond_liq_sweep") else "—"
+
+    # RVOL display — always shown; tells you how strong the displacement was
+    rvol_raw = sig.get("rvol")
+    if rvol_raw is not None:
+        try:
+            rvol_f   = float(rvol_raw)
+            rvol_txt = f"{rvol_f:.2f}×"
+            if rvol_f >= 1.5:
+                rvol_txt = "✦ " + rvol_txt      # strong
+            elif rvol_f < 1.3:
+                rvol_txt = "⚠ " + rvol_txt      # below displacement threshold
+        except (TypeError, ValueError):
+            rvol_txt = "?"
+    else:
+        rvol_txt = "—"
 
     body = (
         f"{dir_emoji} *{sig.get('symbol')} — {sig.get('signal')}*"
         f"{'  ⚡' if not ana else ''}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Tier:* {sig.get('tier')}  |  *Conditions:* {conds}/7\n"
+        f"*Tier:* {sig.get('tier')}  |  *Conditions:* {conds}/{max_c}\n"
         f"*Session:* {sig.get('session')}  |  *TF:* {sig.get('tf')}m\n"
         f"*Combo:* {sig.get('combo')}\n\n"
         f"*Entry:* `{sig.get('price')}`\n"
         f"*Stop:*  `{sig.get('stop')}`\n"
         f"*TP1:*   `{sig.get('target1')}`\n"
         f"*TP2:*   `{sig.get('target2')}`\n\n"
-        f"*ICC:* {icc_txt}  |  *FVG:* {fvg_txt}  |  *Lvl:* {sig.get('near_level')}\n"
+        f"*RVOL:* {rvol_txt}  |  *Sweep:* {sweep_txt}\n"
+        f"*Disp:* {icc_txt}  |  *FVG:* {fvg_txt}  |  *Lvl:* {sig.get('near_level')}\n"
         f"*CCT:* {cct_txt}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
@@ -301,7 +335,9 @@ def format_mode_stamp(trade):
     emoji = {"live": "✅", "paper": "📝", "skipped": "⏸"}.get(mode, "•")
     label = {"live": "LIVE", "paper": "PAPER", "skipped": "SKIPPED"}.get(mode, mode.upper())
     try:
-        ts = datetime.fromisoformat(trade.get("action_time", trade["entry_time"])).strftime("%H:%M:%S")
+        ts = datetime.fromisoformat(
+            trade.get("action_time", trade["entry_time"])
+        ).strftime("%H:%M:%S")
     except Exception:
         ts = "??:??"
     return f"\n\n{emoji} *{label}* at {ts}"
@@ -310,17 +346,19 @@ def format_outcome_footer(trade):
     result = trade.get("result")
     if not result:
         return ""
-    emoji = {"TP1": "🎯", "TP2": "🎯🎯", "STOP": "🛑", "TIMEOUT": "⏱"}.get(result, "•")
+    emoji  = {"TP1": "🎯", "TP2": "🎯🎯", "STOP": "🛑", "TIMEOUT": "⏱"}.get(result, "•")
     try:
         rt = datetime.fromisoformat(trade["result_time"]).strftime("%m/%d %H:%M UTC")
     except Exception:
         rt = str(trade.get("result_time", ""))
     mfe = trade.get("mfe", 0) or 0
     mae = trade.get("mae", 0) or 0
-    return (f"\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"{emoji} *OUTCOME: {result}*\n"
-            f"Resolved: `{rt}`\n"
-            f"MFE: `{mfe:+.2f}`  |  MAE: `{mae:+.2f}`")
+    return (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} *OUTCOME: {result}*\n"
+        f"Resolved: `{rt}`\n"
+        f"MFE: `{mfe:+.2f}`  |  MAE: `{mae:+.2f}`"
+    )
 
 def render_trade(trade):
     return (format_signal_body(trade["sig"], trade.get("ana"))
@@ -353,8 +391,12 @@ def send_text(text, buttons=None):
     return resp.get("result", {}).get("message_id", 0)
 
 def edit_message(message_id, new_text, buttons=None, parse_mode="Markdown"):
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id,
-               "text": new_text, "parse_mode": parse_mode}
+    payload = {
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text":       new_text,
+        "parse_mode": parse_mode,
+    }
     if buttons is not None:
         payload["reply_markup"] = buttons
     tg_api("editMessageText", payload)
@@ -362,38 +404,74 @@ def edit_message(message_id, new_text, buttons=None, parse_mode="Markdown"):
 def answer_callback(callback_id, text="", alert=False):
     tg_api("answerCallbackQuery", {
         "callback_query_id": callback_id,
-        "text": text, "show_alert": alert,
+        "text":       text,
+        "show_alert": alert,
     })
 
-# ── CLAUDE ────────────────────────────────────────────────────
+# ── CLAUDE ANALYSIS ───────────────────────────────────────────
 def analyze(sig):
     if not CLAUDE_ENABLED or not ANTHROPIC_API_KEY:
-        return {"verdict": "REVIEW", "confidence": "N/A",
-                "key_factor": "Claude disabled or no key",
-                "reasoning": "Trade the signal on its own merits."}
-    prompt = f"""You are reviewing a live futures trade signal from a Strat + ICC + CCT system.
+        return {
+            "verdict": "REVIEW", "confidence": "N/A",
+            "key_factor": "Claude disabled or no key",
+            "reasoning": "Trade the signal on its own merits.",
+        }
 
-ROLE: LENIENT. Trust the scoring. Approve most A+ and B setups. Only flag WAIT if there's a clear red flag.
+    # RVOL formatting for prompt
+    rvol_raw = sig.get("rvol")
+    try:
+        rvol_display = f"{float(rvol_raw):.2f}×" if rvol_raw is not None else "N/A"
+    except (TypeError, ValueError):
+        rvol_display = "N/A"
 
-SIGNAL:
- • {sig.get('symbol')} {sig.get('signal')} — {sig.get('combo')}
- • Tier {sig.get('tier')} | Conditions {sig.get('conditions_met', sig.get('score', '?'))}/7 | {sig.get('session')} | {sig.get('tf')}m
+    max_c = sig.get("max_conditions", 7)
+
+    prompt = f"""You are reviewing a live futures trade signal from Kronus AI v9 (Strat + ICC + CCT system).
+
+ROLE: LENIENT. Trust the scoring — Pine v9 already enforces three hardened quality gates:
+  • C2 (sweep) is anchored to a confirmed pivot, not just any N-bar extreme.
+  • C3 (displacement) requires BOTH a wide-range candle AND RVOL ≥ 1.3× avg. Thin-volume bodies are filtered out.
+  • C5 (FVG retrace) requires the wick to tap the gap AND the close to respect it — blowthrough disqualifies.
+If a condition shows True, it has already passed a stricter-than-usual test.
+Approve A+ and A setups. Only flag WAIT if there is a concrete, identifiable red flag.
+
+SIGNAL (Pine v9):
+ • {sig.get('symbol')} {sig.get('signal')} — Combo: {sig.get('combo')}
+ • Tier {sig.get('tier')} | Conditions {sig.get('conditions_met', '?')}/{max_c} | {sig.get('session')} | {sig.get('tf')}m
  • Entry {sig.get('price')} | Stop {sig.get('stop')} | TP1 {sig.get('target1')} | TP2 {sig.get('target2')}
- • HTF bias: {sig.get('cond_htf_bias')} | Sweep: {sig.get('cond_liq_sweep')} | Displacement: {sig.get('cond_displacement')}
- • FVG formed: {sig.get('cond_fvg_formed')} | FVG retrace: {sig.get('cond_fvg_retrace')} | LTF confirm: {sig.get('cond_ltf_confirm')} | Liq target: {sig.get('cond_liq_target')}
- • Near: {sig.get('near_level')} | CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m) | ATR: {sig.get('atr')}
+ • ATR {sig.get('atr')} | RVOL {rvol_display}
 
-Return ONLY valid JSON:
+CONDITION BREAKDOWN:
+ • C1 HTF bias (2+/3 TFs):          {sig.get('cond_htf_bias')}
+ • C2 Sweep (pivot-anchored):        {sig.get('cond_liq_sweep')}
+ • C3 Displacement + volume ≥1.3×:  {sig.get('cond_displacement')}  [RVOL: {rvol_display}]
+ • C4 FVG formed:                    {sig.get('cond_fvg_formed')}
+ • C5 FVG retrace (tap + respect):  {sig.get('cond_fvg_retrace')}
+ • C6 LTF Strat confirm:             {sig.get('cond_ltf_confirm')}
+ • C7 Liquidity target:              {sig.get('cond_liq_target')}
+
+CONTEXT:
+ • Near level: {sig.get('near_level')} | CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m)
+ • Preferred session: {sig.get('in_preferred_sess')}
+
+Return ONLY valid JSON (no markdown, no extra text):
 {{"verdict":"BUY|SELL|WAIT","confidence":"HIGH|MEDIUM|LOW","key_factor":"one sentence","reasoning":"2 sentences max"}}"""
+
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY,
-                     "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json={"model": CLAUDE_MODEL, "max_tokens": 250,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=CLAUDE_TIMEOUT)
+            headers={
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json={
+                "model":      CLAUDE_MODEL,
+                "max_tokens": 250,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            timeout=CLAUDE_TIMEOUT,
+        )
         r.raise_for_status()
         text = r.json()["content"][0]["text"].strip()
         if text.startswith("```"):
@@ -403,14 +481,18 @@ Return ONLY valid JSON:
             text = text.strip().rstrip("`").strip()
         return json.loads(text)
     except requests.exceptions.Timeout:
-        return {"verdict": "REVIEW", "confidence": "N/A",
-                "key_factor": "Claude timed out",
-                "reasoning": "Trade on your own read."}
+        return {
+            "verdict": "REVIEW", "confidence": "N/A",
+            "key_factor": "Claude timed out",
+            "reasoning": "Trade on your own read.",
+        }
     except Exception as e:
         log.error(f"Claude error: {e}")
-        return {"verdict": "REVIEW", "confidence": "N/A",
-                "key_factor": "Claude API error",
-                "reasoning": f"Review manually. ({str(e)[:100]})"}
+        return {
+            "verdict": "REVIEW", "confidence": "N/A",
+            "key_factor": "Claude API error",
+            "reasoning": f"Review manually. ({str(e)[:100]})",
+        }
 
 # ── SIGNAL PROCESSING ─────────────────────────────────────────
 def process_signal_async(sig):
@@ -426,6 +508,7 @@ def process_signal_async(sig):
 
         trade_id = str(msg_id)
         now_iso  = datetime.now(timezone.utc).isoformat()
+
         with STATE_LOCK:
             TRACKING[trade_id] = {
                 "trade_id":     trade_id,
@@ -456,7 +539,7 @@ def process_signal_async(sig):
 
         edit_message(msg_id, render_trade(trade_copy), buttons_for_trade(trade_copy))
 
-        # ── Auto-send pre-filled checklist with every signal ──────────
+        # Auto-send pre-filled checklist below every signal
         auto_state = autofill_checklist(sig)
         cl_result  = tg_api("sendMessage", {
             "chat_id":      TELEGRAM_CHAT_ID,
@@ -468,9 +551,11 @@ def process_signal_async(sig):
         if cl_id:
             with CHECKLIST_LOCK:
                 CHECKLIST_STATE[cl_id] = auto_state
-            edit_message(cl_id,
-                         _checklist_header(auto_state) + "\n_Auto-filled — tap to adjust_",
-                         _checklist_keyboard(auto_state, cl_id))
+            edit_message(
+                cl_id,
+                _checklist_header(auto_state) + "\n_Auto-filled — tap to adjust_",
+                _checklist_keyboard(auto_state, cl_id),
+            )
 
     except Exception as e:
         log.exception(f"process_signal_async error: {e}")
@@ -484,7 +569,7 @@ def _fetch_history(yf_symbol):
             LAST_YF_FETCH[yf_symbol] = {
                 "ok": False,
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "err": "empty result"
+                "err": "empty result",
             }
             return None
         if hist.index.tz is None:
@@ -492,15 +577,15 @@ def _fetch_history(yf_symbol):
         else:
             hist.index = hist.index.tz_convert("UTC")
         LAST_YF_FETCH[yf_symbol] = {
-            "ok": True,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ok":   True,
+            "ts":   datetime.now(timezone.utc).isoformat(),
             "bars": len(hist),
         }
         return hist
     except Exception as e:
         LAST_YF_FETCH[yf_symbol] = {
-            "ok": False,
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ok":  False,
+            "ts":  datetime.now(timezone.utc).isoformat(),
             "err": str(e)[:200],
         }
         log.warning(f"yfinance fetch failed for {yf_symbol}: {e}")
@@ -568,19 +653,17 @@ def _check_trade_against_hist(trade, hist):
 
 def _check_timeout(trade):
     try:
-        entry_ts = pd.Timestamp(trade["entry_time"]) if OUTCOME_TRACKING_AVAILABLE \
-                   else datetime.fromisoformat(trade["entry_time"])
+        entry_ts = (pd.Timestamp(trade["entry_time"])
+                    if OUTCOME_TRACKING_AVAILABLE
+                    else datetime.fromisoformat(trade["entry_time"]))
         if hasattr(entry_ts, "tz") and entry_ts.tz is None:
             entry_ts = entry_ts.tz_localize("UTC")
         elif hasattr(entry_ts, "tz"):
             entry_ts = entry_ts.tz_convert("UTC")
 
-        if hasattr(entry_ts, "to_pydatetime"):
-            entry_dt = entry_ts.to_pydatetime()
-        else:
-            entry_dt = entry_ts
+        entry_dt = entry_ts.to_pydatetime() if hasattr(entry_ts, "to_pydatetime") else entry_ts
+        age      = datetime.now(timezone.utc) - entry_dt
 
-        age = datetime.now(timezone.utc) - entry_dt
         if age > timedelta(hours=TRADE_TIMEOUT_HRS):
             if trade.get("tp1_hit_time"):
                 trade["result"]      = "TP1"
@@ -594,7 +677,7 @@ def _check_timeout(trade):
     return False
 
 def _outcome_tick():
-    # ── PHASE 1: Timeout check (always runs, no yfinance) ─────
+    # Phase 1: timeout check (always runs, no yfinance required)
     with STATE_LOCK:
         active_ids = [tid for tid, t in TRACKING.items() if t.get("result") is None]
 
@@ -617,7 +700,7 @@ def _outcome_tick():
         except Exception as e:
             log.error(f"Timeout edit failed for {t.get('trade_id')}: {e}")
 
-    # ── PHASE 2: yfinance TP/STOP detection (best effort) ─────
+    # Phase 2: yfinance TP/STOP detection (best effort)
     if not OUTCOME_TRACKING_AVAILABLE:
         return
 
@@ -629,7 +712,7 @@ def _outcome_tick():
     by_yf = {}
     with STATE_LOCK:
         for tid in active_ids:
-            t  = TRACKING.get(tid)
+            t   = TRACKING.get(tid)
             if not t:
                 continue
             tv  = t["sig"].get("symbol")
@@ -741,7 +824,7 @@ def recent_skipped():
     if not trades:
         return "*⏸ Skipped*\n\nNone yet."
     trades.sort(key=lambda t: t.get("entry_time", ""), reverse=True)
-    lines = ["*⏸ Recent skipped* (would-be outcomes tracked)\n"]
+    lines = ["*⏸ Recent skipped* (outcome still tracked)\n"]
     for t in trades[:10]:
         s  = t["sig"]
         try:
@@ -762,7 +845,7 @@ def outcomes_summary():
     def _wr(arr):
         w = sum(1 for t in arr if t.get("result") in ("TP1", "TP2"))
         l = sum(1 for t in arr if t.get("result") == "STOP")
-        return w, l, (w/(w+l)*100) if (w+l) else 0
+        return w, l, (w / (w + l) * 100) if (w + l) else 0
 
     lines = ["*📈 Outcome breakdown*\n"]
     for mode in ("live", "paper", "skipped"):
@@ -772,10 +855,12 @@ def outcomes_summary():
         w, l, wr = _wr(arr)
         to = sum(1 for t in arr if t.get("result") == "TIMEOUT")
         me = {"live": "✅", "paper": "📝", "skipped": "⏸"}[mode]
-        lines.append(f"{me} *{mode.upper()}* ({len(arr)}): {w}W / {l}L / {to}TO → {wr:.0f}% WR")
+        lines.append(
+            f"{me} *{mode.upper()}* ({len(arr)}): {w}W / {l}L / {to}TO → {wr:.0f}% WR"
+        )
 
     lines.append("")
-    for tier in ("A+", "B"):
+    for tier in ("A+", "A", "B+", "B"):
         arr = [t for t in resolved if t["sig"].get("tier") == tier]
         if not arr:
             continue
@@ -787,9 +872,13 @@ def help_text():
     session_info = (f"`{', '.join(ALLOWED_SESSIONS)}`"
                     if FILTER_SESSIONS else "OFF — all sessions pass through")
     return (
-        "*📖 Kronus AI v5.3 — Help*\n\n"
+        "*📖 Kronus AI v5.4 — Help*\n\n"
         "Alert fires in ~3s. Claude verdict updates it a few seconds later.\n"
         "Checklist auto-fills from signal conditions below each alert.\n\n"
+        "*Pine v9 signal quality (hardcoded, no toggles):*\n"
+        "• C2 Sweep anchored to confirmed pivot (no chop noise)\n"
+        "• C3 Displacement requires RVOL ≥ 1.3× avg (no thin-volume traps)\n"
+        "• C5 FVG retrace requires tap + close respects level (no blowthrough)\n\n"
         "*Actions:*\n"
         "• ✅ *Live* — real trade, logged & tracked\n"
         "• 📝 *Paper* — simulated, fully tracked\n"
@@ -797,7 +886,8 @@ def help_text():
         f"*Timeout:* {TRADE_TIMEOUT_HRS}h. Trades that don't hit TP/STOP "
         f"resolve to TIMEOUT regardless of yfinance status.\n\n"
         f"*Session filter:* {session_info}\n\n"
-        "*Commands:* `/menu` `/checklist` `/today` `/journal` `/skipped` `/outcomes` `/status` `/debug` `/help`"
+        "*Commands:* `/menu` `/checklist` `/today` `/journal` "
+        "`/skipped` `/outcomes` `/status` `/debug` `/help`"
     )
 
 def status_text():
@@ -806,15 +896,17 @@ def status_text():
         counts = {"pending": 0, "live": 0, "paper": 0, "skipped": 0}
         open_  = 0
         for t in TRACKING.values():
-            counts[t.get("mode", "pending")] = counts.get(t.get("mode", "pending"), 0) + 1
+            mode = t.get("mode", "pending")
+            counts[mode] = counts.get(mode, 0) + 1
             if t.get("result") is None:
                 open_ += 1
-    tracker      = ("✅ yfinance" if OUTCOME_TRACKING_AVAILABLE else "❌")
+    tracker      = "✅ yfinance" if OUTCOME_TRACKING_AVAILABLE else "❌"
     session_line = (f"✅ ON → `{', '.join(ALLOWED_SESSIONS)}`"
                     if FILTER_SESSIONS else "⛔ OFF")
     return (
         "*⚙️ Kronus AI — Status*\n\n"
-        f"Version: *v5.3 (auto-fill checklist)*\n"
+        f"Version: *v5.4 (Pine v9 compatible)*\n"
+        f"Pine: *v9* (pivot sweep · vol displacement · tight FVG retrace)\n"
         f"Claude: {'✅ ' + CLAUDE_MODEL if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else '❌'}\n"
         f"Telegram: {'✅' if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else '❌'}\n"
         f"Tracker: {tracker}\n"
@@ -831,14 +923,13 @@ def debug_text():
         open_trades = [deepcopy(t) for t in TRACKING.values() if t.get("result") is None]
 
     lines = ["*🐛 Debug — open trades*\n"]
-
     if not open_trades:
         lines.append("_No open trades._")
     else:
         for t in open_trades[:15]:
             s = t["sig"]
             try:
-                entry = datetime.fromisoformat(t["entry_time"])
+                entry   = datetime.fromisoformat(t["entry_time"])
                 age_hrs = (now - entry).total_seconds() / 3600
                 age_str = f"{age_hrs:.1f}h"
             except Exception:
@@ -849,12 +940,12 @@ def debug_text():
 
     lines.append("\n*Last yfinance fetches:*")
     if not LAST_YF_FETCH:
-        lines.append("_No fetches yet — tracker may not be running._")
+        lines.append("_No fetches yet._")
     else:
         for sym, info in LAST_YF_FETCH.items():
-            ok = "✅" if info.get("ok") else "❌"
+            ok  = "✅" if info.get("ok") else "❌"
             try:
-                ago = (now - datetime.fromisoformat(info["ts"])).total_seconds() / 60
+                ago     = (now - datetime.fromisoformat(info["ts"])).total_seconds() / 60
                 ago_str = f"{ago:.0f}m ago"
             except Exception:
                 ago_str = "?"
@@ -871,7 +962,13 @@ def home():
         open_ = sum(1 for t in TRACKING.values() if t.get("result") is None)
     return jsonify({
         "status":           "running",
-        "bot":              "Kronus AI v5.3 (auto-fill checklist)",
+        "bot":              "Kronus AI v5.4 (Pine v9 compatible)",
+        "pine_version":     "v9",
+        "pine_improvements": [
+            "C2 sweep anchored to confirmed pivot",
+            "C3 displacement requires RVOL >= 1.3x avg",
+            "C5 FVG retrace: wick tap + close respects level",
+        ],
         "claude":           "enabled" if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else "disabled",
         "claude_model":     CLAUDE_MODEL,
         "telegram":         "enabled" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
@@ -887,9 +984,9 @@ def home():
 def webhook():
     try:
         raw = request.get_data(as_text=True)
-        log.info(f"Webhook in: {raw[:250]}")
+        log.info(f"Webhook in: {raw[:300]}")
         sig = json.loads(raw)
-    except Exception as e:
+    except Exception:
         return jsonify({"error": "invalid JSON"}), 400
 
     if sig.get("secret") != WEBHOOK_SECRET:
@@ -925,7 +1022,6 @@ def telegram_update():
 
         if action == "open_checklist":
             answer_callback(cb_id)
-            # Pre-fill from the originating signal if we have it
             with STATE_LOCK:
                 origin = TRACKING.get(trade_id)
             init_state = autofill_checklist(origin["sig"]) if origin else {}
@@ -939,9 +1035,11 @@ def telegram_update():
             if new_id:
                 with CHECKLIST_LOCK:
                     CHECKLIST_STATE[new_id] = init_state
-                edit_message(new_id,
-                             _checklist_header(init_state) + "\n_Auto-filled — tap to adjust_",
-                             _checklist_keyboard(init_state, new_id))
+                edit_message(
+                    new_id,
+                    _checklist_header(init_state) + "\n_Auto-filled — tap to adjust_",
+                    _checklist_keyboard(init_state, new_id),
+                )
             return jsonify({"ok": True})
 
         if action == "cl_toggle" and len(parts) == 3:
@@ -973,7 +1071,7 @@ def telegram_update():
                 f"Conditions met: *{checked}/8*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"*Missing:*\n{missing_str}",
-                menu_buttons()
+                menu_buttons(),
             )
             return jsonify({"ok": True})
 
@@ -1039,9 +1137,9 @@ def telegram_update():
             send_text("*📊 Kronus AI — Main Menu*\n\nPick an option:", menu_buttons())
 
         elif text == "/checklist":
-            # Pre-fill from most recent signal if available
             with STATE_LOCK:
-                recent = sorted(TRACKING.values(), key=lambda t: t.get("entry_time", ""), reverse=True)
+                recent = sorted(TRACKING.values(),
+                                key=lambda t: t.get("entry_time", ""), reverse=True)
             init_state = autofill_checklist(recent[0]["sig"]) if recent else {}
             result = tg_api("sendMessage", {
                 "chat_id":      TELEGRAM_CHAT_ID,
@@ -1070,8 +1168,10 @@ def telegram_update():
 @app.route("/outcomes", methods=["GET"])
 def outcomes_json():
     with STATE_LOCK:
-        return jsonify({"count": len(TRACKING),
-                        "trades": list(TRACKING.values())})
+        return jsonify({
+            "count":  len(TRACKING),
+            "trades": list(TRACKING.values()),
+        })
 
 @app.route("/debug", methods=["GET"])
 def debug_json():
@@ -1089,16 +1189,16 @@ def debug_json():
             trades.append({
                 "trade_id":  t["trade_id"],
                 "symbol":    t["sig"].get("symbol"),
-                "yf_symbol": YF_SYMBOL_MAP.get(t["sig"].get("symbol"), None),
+                "yf_symbol": YF_SYMBOL_MAP.get(t["sig"].get("symbol")),
                 "mode":      t.get("mode"),
                 "age_hrs":   age_hrs,
                 "tp1_hit":   t.get("tp1_hit_time") is not None,
             })
     return jsonify({
-        "open_trades":    trades,
-        "yf_last_fetch":  LAST_YF_FETCH,
-        "timeout_hrs":    TRADE_TIMEOUT_HRS,
-        "poll_sec":       OUTCOME_POLL_SEC,
+        "open_trades":   trades,
+        "yf_last_fetch": LAST_YF_FETCH,
+        "timeout_hrs":   TRADE_TIMEOUT_HRS,
+        "poll_sec":      OUTCOME_POLL_SEC,
     })
 
 @app.route("/setup_telegram", methods=["GET"])
@@ -1108,8 +1208,10 @@ def setup_telegram():
     if not PUBLIC_URL:
         return jsonify({"error": "PUBLIC_URL env var not set"}), 400
     target = f"{PUBLIC_URL.rstrip('/')}/telegram"
-    resp   = tg_api("setWebhook", {"url": target,
-                                   "allowed_updates": ["message", "callback_query"]})
+    resp   = tg_api("setWebhook", {
+        "url":             target,
+        "allowed_updates": ["message", "callback_query"],
+    })
     return jsonify({"target": target, "telegram_response": resp})
 
 @app.route("/ping", methods=["GET"])
@@ -1118,22 +1220,39 @@ def ping():
 
 @app.route("/test", methods=["GET"])
 def test():
+    """Fire a realistic Pine v9 test signal — includes rvol field."""
     fake = {
-        "secret": WEBHOOK_SECRET, "symbol": "MGC1!", "tf": "15", "session": "NY-AM",
-        "tier": "A+", "conditions_met": 7, "signal": "LONG", "combo": "2-2 Bull",
-        "price": 2650.50, "stop": 2648.00, "target1": 2654.25, "target2": 2656.75,
-        "near_level": "PDH", "cct_open": True, "mins_to_close": 18, "atr": 1.67,
-        "in_preferred_sess":  True,
-        "cond_htf_bias":      True,
-        "cond_liq_sweep":     True,
-        "cond_displacement":  True,
-        "cond_fvg_formed":    True,
-        "cond_fvg_retrace":   True,
-        "cond_ltf_confirm":   True,
-        "cond_liq_target":    True,
+        "secret":            WEBHOOK_SECRET,
+        "symbol":            "MGC1!",
+        "tf":                "15",
+        "session":           "NY-AM",
+        "tier":              "A+",
+        "conditions_met":    7,
+        "max_conditions":    7,
+        "signal":            "LONG",
+        "combo":             "2-2 Bull",
+        "price":             2650.50,
+        "stop":              2648.00,
+        "target1":           2654.25,
+        "target2":           2656.75,
+        "atr":               1.67,
+        "rvol":              1.84,          # Pine v9: always sent
+        "near_level":        "PDH",
+        "cct_open":          True,
+        "mins_to_close":     18,
+        "in_session":        True,
+        "in_preferred_sess": True,
+        # Pine v9 condition booleans (all hardened):
+        "cond_htf_bias":     True,
+        "cond_liq_sweep":    True,    # pivot-anchored
+        "cond_displacement": True,    # body + RVOL >= 1.3x
+        "cond_fvg_formed":   True,
+        "cond_fvg_retrace":  True,    # tap + close respects level
+        "cond_ltf_confirm":  True,
+        "cond_liq_target":   True,
     }
     threading.Thread(target=process_signal_async, args=(fake,), daemon=True).start()
-    return jsonify({"test": "dispatched"})
+    return jsonify({"test": "dispatched", "pine_version": "v9"})
 
 # ── STARTUP ───────────────────────────────────────────────────
 load_state()
@@ -1142,5 +1261,5 @@ if OUTCOME_TRACKING_AVAILABLE:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    log.info(f"Kronus AI v5.3 starting on port {port}")
+    log.info(f"Kronus AI v5.4 starting on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
