@@ -1,19 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  KRONUS AI — MAIN SERVER  (v5.2 — timeout fix)              ║
+║  KRONUS AI — MAIN SERVER  (v5.3 — checklist auto-fill)      ║
 ║                                                              ║
-║  NEW vs v5.1:                                                ║
-║   • Timeout check now runs INDEPENDENTLY of yfinance.       ║
-║     Old behavior: if yfinance failed to fetch price, the    ║
-║     timeout check never ran → trades stayed open forever.   ║
-║     New behavior: every poll cycle, ALL active trades are   ║
-║     checked for >4hr age first. yfinance is best-effort     ║
-║     for TP/STOP detection but no longer blocks timeouts.    ║
-║                                                              ║
-║   • Added /debug endpoint — shows what state every active   ║
-║     trade is in plus when last yfinance check ran. If a     ║
-║     trade ever stays open past timeout again, you can hit   ║
-║     this endpoint to see exactly why.                        ║
+║  NEW vs v5.2:                                                ║
+║   • autofill_checklist(sig) — reads the 7 condition         ║
+║     booleans sent by Pine v8 and pre-fills the checklist.   ║
+║     Every signal now auto-sends a filled checklist below    ║
+║     the trade alert. Still fully tap-to-toggle.             ║
+║   • /checklist command pre-fills from most recent signal.   ║
+║   • Checklist button on signal card pre-fills from that     ║
+║     card's own trade signal.                                 ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 import os
@@ -95,9 +91,29 @@ def grade_setup(state: dict) -> tuple:
     else:
         return "B",  "Weak setup — SKIP IT", "❌"
 
+# ── NEW: AUTO-FILL CHECKLIST FROM PINE v8 SIGNAL ─────────────
+def autofill_checklist(sig: dict) -> dict:
+    """
+    Reads the 7 condition booleans Pine v8 sends in the webhook
+    and returns a pre-filled checklist state dict.
+    All items are still tap-to-toggle after auto-fill.
+    """
+    return {
+        "c0": sig.get("in_preferred_sess", False),
+        "c1": sig.get("cond_htf_bias",     False),
+        "c2": sig.get("cond_liq_sweep",     False),
+        "c3": sig.get("cond_displacement",  False),
+        "c4": sig.get("cond_fvg_formed",    False),
+        "c5": sig.get("cond_fvg_retrace",   False),
+        "c6": sig.get("cond_ltf_confirm",   False),
+        "c7": sig.get("cond_liq_target",    False),
+        "_autofilled": True,
+    }
+
 def _checklist_header(state: dict) -> str:
     checked = sum(1 for k, _ in CHECKLIST_ITEMS if state.get(k, False))
-    return f"🔥 *A+ Setup Checklist*\n_Tap to check off each condition ({checked}/8)_\n"
+    auto    = " _(auto-filled)_" if state.get("_autofilled") else ""
+    return f"🔥 *A+ Setup Checklist*\n_Tap to check off each condition ({checked}/8)_{auto}\n"
 
 def _checklist_keyboard(state: dict, msg_id: int) -> dict:
     rows = []
@@ -132,7 +148,7 @@ YF_SYMBOL_MAP = {
 STATE_LOCK      = threading.RLock()
 TRACKING        = {}
 UNMAPPED_WARNED = set()
-LAST_YF_FETCH   = {}   # yf_symbol -> {"ok": bool, "ts": iso, "err": str}
+LAST_YF_FETCH   = {}
 
 # ── PERSISTENCE ───────────────────────────────────────────────
 def _save_state_unlocked():
@@ -248,21 +264,21 @@ def menu_buttons():
 def format_signal_body(sig, ana=None):
     dir_emoji = "📈" if sig.get("signal") == "LONG" else "📉"
     cct_txt   = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
-    icc_txt   = "✓" if sig.get("icc") else "—"
-    fvg_txt   = "✓" if sig.get("fvg") else "—"
+    icc_txt   = "✓" if sig.get("cond_displacement") or sig.get("icc") else "—"
+    fvg_txt   = "✓" if sig.get("cond_fvg_formed")   or sig.get("fvg") else "—"
+    conds     = sig.get("conditions_met", sig.get("score", "?"))
 
     body = (
         f"{dir_emoji} *{sig.get('symbol')} — {sig.get('signal')}*"
         f"{'  ⚡' if not ana else ''}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Tier:* {sig.get('tier')}  |  *Score:* {sig.get('score')}/100\n"
+        f"*Tier:* {sig.get('tier')}  |  *Conditions:* {conds}/7\n"
         f"*Session:* {sig.get('session')}  |  *TF:* {sig.get('tf')}m\n"
         f"*Combo:* {sig.get('combo')}\n\n"
         f"*Entry:* `{sig.get('price')}`\n"
         f"*Stop:*  `{sig.get('stop')}`\n"
         f"*TP1:*   `{sig.get('target1')}`\n"
         f"*TP2:*   `{sig.get('target2')}`\n\n"
-        f"*TFC:* 4H {sig.get('tfc_4h')} / 1H {sig.get('tfc_1h')} / 15m {sig.get('tfc_15')}\n"
         f"*ICC:* {icc_txt}  |  *FVG:* {fvg_txt}  |  *Lvl:* {sig.get('near_level')}\n"
         f"*CCT:* {cct_txt}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
@@ -361,11 +377,11 @@ ROLE: LENIENT. Trust the scoring. Approve most A+ and B setups. Only flag WAIT i
 
 SIGNAL:
  • {sig.get('symbol')} {sig.get('signal')} — {sig.get('combo')}
- • Tier {sig.get('tier')} | Score {sig.get('score')}/100 | {sig.get('session')} | {sig.get('tf')}m
+ • Tier {sig.get('tier')} | Conditions {sig.get('conditions_met', sig.get('score', '?'))}/7 | {sig.get('session')} | {sig.get('tf')}m
  • Entry {sig.get('price')} | Stop {sig.get('stop')} | TP1 {sig.get('target1')} | TP2 {sig.get('target2')}
- • TFC: 4H {sig.get('tfc_4h')} / 1H {sig.get('tfc_1h')} / 15m {sig.get('tfc_15')}
- • ICC: {sig.get('icc')} | FVG: {sig.get('fvg')} | Near: {sig.get('near_level')}
- • CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m to close) | ATR: {sig.get('atr')}
+ • HTF bias: {sig.get('cond_htf_bias')} | Sweep: {sig.get('cond_liq_sweep')} | Displacement: {sig.get('cond_displacement')}
+ • FVG formed: {sig.get('cond_fvg_formed')} | FVG retrace: {sig.get('cond_fvg_retrace')} | LTF confirm: {sig.get('cond_ltf_confirm')} | Liq target: {sig.get('cond_liq_target')}
+ • Near: {sig.get('near_level')} | CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m) | ATR: {sig.get('atr')}
 
 Return ONLY valid JSON:
 {{"verdict":"BUY|SELL|WAIT","confidence":"HIGH|MEDIUM|LOW","key_factor":"one sentence","reasoning":"2 sentences max"}}"""
@@ -439,12 +455,28 @@ def process_signal_async(sig):
             _save_state_unlocked()
 
         edit_message(msg_id, render_trade(trade_copy), buttons_for_trade(trade_copy))
+
+        # ── Auto-send pre-filled checklist with every signal ──────────
+        auto_state = autofill_checklist(sig)
+        cl_result  = tg_api("sendMessage", {
+            "chat_id":      TELEGRAM_CHAT_ID,
+            "text":         _checklist_header(auto_state) + "\n_Auto-filled — tap to adjust_",
+            "parse_mode":   "Markdown",
+            "reply_markup": _checklist_keyboard(auto_state, 0),
+        })
+        cl_id = cl_result.get("result", {}).get("message_id", 0)
+        if cl_id:
+            with CHECKLIST_LOCK:
+                CHECKLIST_STATE[cl_id] = auto_state
+            edit_message(cl_id,
+                         _checklist_header(auto_state) + "\n_Auto-filled — tap to adjust_",
+                         _checklist_keyboard(auto_state, cl_id))
+
     except Exception as e:
         log.exception(f"process_signal_async error: {e}")
 
 # ── OUTCOME TRACKER ───────────────────────────────────────────
 def _fetch_history(yf_symbol):
-    """Fetch and record success/failure for /debug visibility."""
     try:
         t    = yf.Ticker(yf_symbol)
         hist = t.history(period="2d", interval="1m", auto_adjust=False)
@@ -475,7 +507,6 @@ def _fetch_history(yf_symbol):
         return None
 
 def _check_trade_against_hist(trade, hist):
-    """Check trade against price history. Returns True if newly resolved."""
     sig = trade["sig"]
     try:
         entry_ts = pd.Timestamp(trade["entry_time"])
@@ -536,7 +567,6 @@ def _check_trade_against_hist(trade, hist):
     return False
 
 def _check_timeout(trade):
-    """Pure age check — no yfinance dependency. Returns True if timed out."""
     try:
         entry_ts = pd.Timestamp(trade["entry_time"]) if OUTCOME_TRACKING_AVAILABLE \
                    else datetime.fromisoformat(trade["entry_time"])
@@ -564,11 +594,6 @@ def _check_timeout(trade):
     return False
 
 def _outcome_tick():
-    """
-    NEW v5.2 ORDER:
-    1. Check timeouts on EVERY active trade (no yfinance needed)
-    2. Then attempt yfinance TP/STOP detection on remaining open trades
-    """
     # ── PHASE 1: Timeout check (always runs, no yfinance) ─────
     with STATE_LOCK:
         active_ids = [tid for tid, t in TRACKING.items() if t.get("result") is None]
@@ -585,7 +610,6 @@ def _outcome_tick():
             if timeout_resolved:
                 _save_state_unlocked()
 
-    # Edit Telegram messages for timeouts (outside lock)
     for t in timeout_resolved:
         try:
             edit_message(t["message_id"], render_trade(t), resolved_buttons())
@@ -625,7 +649,7 @@ def _outcome_tick():
     for yfs, tids in by_yf.items():
         hist = hist_cache.get(yfs)
         if hist is None:
-            continue   # yfinance failed for this symbol — timeouts already handled
+            continue
         for tid in tids:
             trade_copy     = None
             newly_resolved = False
@@ -763,8 +787,9 @@ def help_text():
     session_info = (f"`{', '.join(ALLOWED_SESSIONS)}`"
                     if FILTER_SESSIONS else "OFF — all sessions pass through")
     return (
-        "*📖 Kronus AI v5.2 — Help*\n\n"
-        "Alert fires in ~3s. Claude verdict updates it a few seconds later.\n\n"
+        "*📖 Kronus AI v5.3 — Help*\n\n"
+        "Alert fires in ~3s. Claude verdict updates it a few seconds later.\n"
+        "Checklist auto-fills from signal conditions below each alert.\n\n"
         "*Actions:*\n"
         "• ✅ *Live* — real trade, logged & tracked\n"
         "• 📝 *Paper* — simulated, fully tracked\n"
@@ -789,7 +814,7 @@ def status_text():
                     if FILTER_SESSIONS else "⛔ OFF")
     return (
         "*⚙️ Kronus AI — Status*\n\n"
-        f"Version: *v5.2 (timeout fix)*\n"
+        f"Version: *v5.3 (auto-fill checklist)*\n"
         f"Claude: {'✅ ' + CLAUDE_MODEL if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else '❌'}\n"
         f"Telegram: {'✅' if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else '❌'}\n"
         f"Tracker: {tracker}\n"
@@ -801,7 +826,6 @@ def status_text():
     )
 
 def debug_text():
-    """Show every open trade's age + last yfinance fetch status."""
     now = datetime.now(timezone.utc)
     with STATE_LOCK:
         open_trades = [deepcopy(t) for t in TRACKING.values() if t.get("result") is None]
@@ -847,7 +871,7 @@ def home():
         open_ = sum(1 for t in TRACKING.values() if t.get("result") is None)
     return jsonify({
         "status":           "running",
-        "bot":              "Kronus AI v5.2 (timeout fix)",
+        "bot":              "Kronus AI v5.3 (auto-fill checklist)",
         "claude":           "enabled" if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else "disabled",
         "claude_model":     CLAUDE_MODEL,
         "telegram":         "enabled" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "disabled",
@@ -901,18 +925,23 @@ def telegram_update():
 
         if action == "open_checklist":
             answer_callback(cb_id)
+            # Pre-fill from the originating signal if we have it
+            with STATE_LOCK:
+                origin = TRACKING.get(trade_id)
+            init_state = autofill_checklist(origin["sig"]) if origin else {}
             result = tg_api("sendMessage", {
                 "chat_id":      TELEGRAM_CHAT_ID,
-                "text":         _checklist_header({}),
+                "text":         _checklist_header(init_state) + "\n_Auto-filled — tap to adjust_",
                 "parse_mode":   "Markdown",
-                "reply_markup": _checklist_keyboard({}, 0),
+                "reply_markup": _checklist_keyboard(init_state, 0),
             })
             new_id = result.get("result", {}).get("message_id", 0)
             if new_id:
                 with CHECKLIST_LOCK:
-                    CHECKLIST_STATE[new_id] = {}
-                edit_message(new_id, _checklist_header({}),
-                             _checklist_keyboard({}, new_id))
+                    CHECKLIST_STATE[new_id] = init_state
+                edit_message(new_id,
+                             _checklist_header(init_state) + "\n_Auto-filled — tap to adjust_",
+                             _checklist_keyboard(init_state, new_id))
             return jsonify({"ok": True})
 
         if action == "cl_toggle" and len(parts) == 3:
@@ -1010,18 +1039,22 @@ def telegram_update():
             send_text("*📊 Kronus AI — Main Menu*\n\nPick an option:", menu_buttons())
 
         elif text == "/checklist":
+            # Pre-fill from most recent signal if available
+            with STATE_LOCK:
+                recent = sorted(TRACKING.values(), key=lambda t: t.get("entry_time", ""), reverse=True)
+            init_state = autofill_checklist(recent[0]["sig"]) if recent else {}
             result = tg_api("sendMessage", {
                 "chat_id":      TELEGRAM_CHAT_ID,
-                "text":         _checklist_header({}),
+                "text":         _checklist_header(init_state),
                 "parse_mode":   "Markdown",
-                "reply_markup": _checklist_keyboard({}, 0),
+                "reply_markup": _checklist_keyboard(init_state, 0),
             })
             new_id = result.get("result", {}).get("message_id", 0)
             if new_id:
                 with CHECKLIST_LOCK:
-                    CHECKLIST_STATE[new_id] = {}
-                edit_message(new_id, _checklist_header({}),
-                             _checklist_keyboard({}, new_id))
+                    CHECKLIST_STATE[new_id] = init_state
+                edit_message(new_id, _checklist_header(init_state),
+                             _checklist_keyboard(init_state, new_id))
 
         elif text == "/today":    send_text(today_stats(),      menu_buttons())
         elif text == "/journal":  send_text(recent_journal(),   menu_buttons())
@@ -1042,7 +1075,6 @@ def outcomes_json():
 
 @app.route("/debug", methods=["GET"])
 def debug_json():
-    """Web version of /debug command for browser inspection."""
     now = datetime.now(timezone.utc)
     with STATE_LOCK:
         trades = []
@@ -1088,11 +1120,17 @@ def ping():
 def test():
     fake = {
         "secret": WEBHOOK_SECRET, "symbol": "MGC1!", "tf": "15", "session": "NY-AM",
-        "tier": "A+", "score": 85, "signal": "LONG", "combo": "2-2 Bull",
+        "tier": "A+", "conditions_met": 7, "signal": "LONG", "combo": "2-2 Bull",
         "price": 2650.50, "stop": 2648.00, "target1": 2654.25, "target2": 2656.75,
-        "tfc_4h": "BULL", "tfc_1h": "BULL", "tfc_15": "BULL",
-        "icc": True, "fvg": True, "near_level": "PDH",
-        "cct_open": True, "mins_to_close": 18, "atr": 1.67,
+        "near_level": "PDH", "cct_open": True, "mins_to_close": 18, "atr": 1.67,
+        "in_preferred_sess":  True,
+        "cond_htf_bias":      True,
+        "cond_liq_sweep":     True,
+        "cond_displacement":  True,
+        "cond_fvg_formed":    True,
+        "cond_fvg_retrace":   True,
+        "cond_ltf_confirm":   True,
+        "cond_liq_target":    True,
     }
     threading.Thread(target=process_signal_async, args=(fake,), daemon=True).start()
     return jsonify({"test": "dispatched"})
@@ -1104,6 +1142,5 @@ if OUTCOME_TRACKING_AVAILABLE:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    log.info(f"Kronus AI v5.2 starting on port {port}")
+    log.info(f"Kronus AI v5.3 starting on port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
-    
