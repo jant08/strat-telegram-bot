@@ -1,18 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║  KRONUS AI — MAIN SERVER  (v5.4 — Pine v9 compatible)       ║
+║  KRONUS AI — MAIN SERVER  (v5.5 — Pine v9.1 compatible)     ║
 ║                                                              ║
-║  CHANGES vs v5.3:                                            ║
-║   • RVOL displayed on every Telegram signal card.            ║
-║   • Conditions shown as X/max_conditions (not hardcoded /7) ║
-║     so future Pine changes never create "8/7" displays.     ║
-║   • C3 checklist label updated: "Strong displacement +       ║
-║     volume (≥1.3× avg)" — matches Pine v9 definition.       ║
-║   • Claude prompt updated: describes pivot-anchored sweep,   ║
-║     volume-gated displacement, and tight FVG retrace so      ║
-║     Claude's analysis reflects the actual signal quality.    ║
-║   • /test route includes rvol field matching Pine v9.        ║
-║   • Version strings updated throughout.                      ║
+║  CHANGES vs v5.4:                                            ║
+║   • ICC+CCT confluence banner on Telegram signal cards.      ║
+║     ⭐ fires when displacement (C3) + CCT align on same bar. ║
+║   • Tier upgrade shown on card: "A ↑ from B+ via ★ ICC+CCT" ║
+║   • Claude prompt explains ICC+CCT and weights it higher.    ║
+║   • /status and /help updated for v9.1 chart behavior.      ║
+║   • Chart note: B and B+ no longer appear on chart at all.  ║
+║   • /test route sends icc_cct_confluence field.              ║
 ║                                                              ║
 ║  v5.3 PRESERVED:                                             ║
 ║   autofill_checklist from Pine booleans | /checklist command ║
@@ -301,11 +298,24 @@ def format_signal_body(sig, ana=None):
     else:
         rvol_txt = "—"
 
+    # ICC+CCT confluence — displacement + close proximity = high-conviction flag
+    icc_cct = sig.get("icc_cct_confluence", False)
+    raw_tier = sig.get("raw_tier", sig.get("tier", "?"))
+    tier_now = sig.get("tier", "?")
+
+    # Show upgrade note when B+ was bumped to A via ICC+CCT
+    tier_display = tier_now
+    if raw_tier != tier_now and raw_tier == "B+":
+        tier_display = f"{tier_now} _(↑ from B+ via ★ ICC+CCT)_"
+
+    # Confluence banner — only on cards where it fired
+    cct_conf_line = "\n⭐ *ICC+CCT CONFLUENCE* — Displacement at daily close\n" if icc_cct else ""
+
     body = (
         f"{dir_emoji} *{sig.get('symbol')} — {sig.get('signal')}*"
         f"{'  ⚡' if not ana else ''}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Tier:* {sig.get('tier')}  |  *Conditions:* {conds}/{max_c}\n"
+        f"*Tier:* {tier_display}  |  *Conditions:* {conds}/{max_c}\n"
         f"*Session:* {sig.get('session')}  |  *TF:* {sig.get('tf')}m\n"
         f"*Combo:* {sig.get('combo')}\n\n"
         f"*Entry:* `{sig.get('price')}`\n"
@@ -314,7 +324,8 @@ def format_signal_body(sig, ana=None):
         f"*TP2:*   `{sig.get('target2')}`\n\n"
         f"*RVOL:* {rvol_txt}  |  *Sweep:* {sweep_txt}\n"
         f"*Disp:* {icc_txt}  |  *FVG:* {fvg_txt}  |  *Lvl:* {sig.get('near_level')}\n"
-        f"*CCT:* {cct_txt}\n"
+        f"*CCT:* {cct_txt}"
+        f"{cct_conf_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -424,34 +435,42 @@ def analyze(sig):
     except (TypeError, ValueError):
         rvol_display = "N/A"
 
+    icc_cct_display = "YES ⭐" if sig.get("icc_cct_confluence") else "no"
+
     max_c = sig.get("max_conditions", 7)
 
-    prompt = f"""You are reviewing a live futures trade signal from Kronus AI v9 (Strat + ICC + CCT system).
+    prompt = f"""You are reviewing a live futures trade signal from Kronus AI v9.1 (Strat + ICC + CCT system).
 
-ROLE: LENIENT. Trust the scoring — Pine v9 already enforces three hardened quality gates:
-  • C2 (sweep) is anchored to a confirmed pivot, not just any N-bar extreme.
-  • C3 (displacement) requires BOTH a wide-range candle AND RVOL ≥ 1.3× avg. Thin-volume bodies are filtered out.
-  • C5 (FVG retrace) requires the wick to tap the gap AND the close to respect it — blowthrough disqualifies.
-If a condition shows True, it has already passed a stricter-than-usual test.
-Approve A+ and A setups. Only flag WAIT if there is a concrete, identifiable red flag.
+ROLE: LENIENT. Trust the scoring — Pine v9.1 already enforces hardened quality gates:
+  • C2 (sweep) is anchored to a confirmed pivot — no chop sweeps pass.
+  • C3 (displacement) requires BOTH a wide-range candle AND RVOL ≥ 1.3× avg — thin-volume bodies filtered.
+  • C5 (FVG retrace) requires wick tap AND close respects the far edge — blowthrough disqualifies.
+  • B+ signals upgraded to A when ICC+CCT confluence is present (see below).
+  • Chart only shows A and A+ — B/B+ are Telegram-only.
+If a condition is True it passed a strict gate. Approve A+ and A setups unless there is a concrete red flag.
 
-SIGNAL (Pine v9):
+SIGNAL (Pine v9.1):
  • {sig.get('symbol')} {sig.get('signal')} — Combo: {sig.get('combo')}
  • Tier {sig.get('tier')} | Conditions {sig.get('conditions_met', '?')}/{max_c} | {sig.get('session')} | {sig.get('tf')}m
  • Entry {sig.get('price')} | Stop {sig.get('stop')} | TP1 {sig.get('target1')} | TP2 {sig.get('target2')}
  • ATR {sig.get('atr')} | RVOL {rvol_display}
 
 CONDITION BREAKDOWN:
- • C1 HTF bias (2+/3 TFs):          {sig.get('cond_htf_bias')}
- • C2 Sweep (pivot-anchored):        {sig.get('cond_liq_sweep')}
- • C3 Displacement + volume ≥1.3×:  {sig.get('cond_displacement')}  [RVOL: {rvol_display}]
- • C4 FVG formed:                    {sig.get('cond_fvg_formed')}
- • C5 FVG retrace (tap + respect):  {sig.get('cond_fvg_retrace')}
- • C6 LTF Strat confirm:             {sig.get('cond_ltf_confirm')}
- • C7 Liquidity target:              {sig.get('cond_liq_target')}
+ • C1 HTF bias (2+/3 TFs):           {sig.get('cond_htf_bias')}
+ • C2 Sweep (pivot-anchored):         {sig.get('cond_liq_sweep')}
+ • C3 Displacement + volume ≥1.3×:   {sig.get('cond_displacement')}  [RVOL: {rvol_display}]
+ • C4 FVG formed:                     {sig.get('cond_fvg_formed')}
+ • C5 FVG retrace (tap + respect):   {sig.get('cond_fvg_retrace')}
+ • C6 LTF Strat confirm:              {sig.get('cond_ltf_confirm')}
+ • C7 Liquidity target:               {sig.get('cond_liq_target')}
+
+ICC+CCT CONFLUENCE: {icc_cct_display}
+  This fires when displacement (C3) and CCT (near daily close) align on the same bar.
+  It means strong participation is pushing price right at the session close — historically
+  a higher R:R situation. If True, weight this signal more heavily.
 
 CONTEXT:
- • Near level: {sig.get('near_level')} | CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m)
+ • Near level: {sig.get('near_level')} | CCT open: {sig.get('cct_open')} ({sig.get('mins_to_close')}m to close)
  • Preferred session: {sig.get('in_preferred_sess')}
 
 Return ONLY valid JSON (no markdown, no extra text):
@@ -872,10 +891,14 @@ def help_text():
     session_info = (f"`{', '.join(ALLOWED_SESSIONS)}`"
                     if FILTER_SESSIONS else "OFF — all sessions pass through")
     return (
-        "*📖 Kronus AI v5.4 — Help*\n\n"
+        "*📖 Kronus AI v5.5 — Help*\n\n"
         "Alert fires in ~3s. Claude verdict updates it a few seconds later.\n"
         "Checklist auto-fills from signal conditions below each alert.\n\n"
-        "*Pine v9 signal quality (hardcoded, no toggles):*\n"
+        "*Pine v9.1 chart behavior:*\n"
+        "• *Only A and A+ signals appear on chart* — B/B+ are Telegram-only\n"
+        "• ★ gold star on chart = ICC+CCT confluence (displacement at daily close)\n"
+        "• B+ signals upgraded to A automatically when ICC+CCT fires\n\n"
+        "*Pine v9.1 signal quality (hardcoded):*\n"
         "• C2 Sweep anchored to confirmed pivot (no chop noise)\n"
         "• C3 Displacement requires RVOL ≥ 1.3× avg (no thin-volume traps)\n"
         "• C5 FVG retrace requires tap + close respects level (no blowthrough)\n\n"
@@ -905,8 +928,8 @@ def status_text():
                     if FILTER_SESSIONS else "⛔ OFF")
     return (
         "*⚙️ Kronus AI — Status*\n\n"
-        f"Version: *v5.4 (Pine v9 compatible)*\n"
-        f"Pine: *v9* (pivot sweep · vol displacement · tight FVG retrace)\n"
+        f"Version: *v5.5 (Pine v9.1 compatible)*\n"
+        f"Pine: *v9.1* (clean chart A/A+ only · ICC+CCT confluence · pivot sweep · vol disp · tight FVG)\n"
         f"Claude: {'✅ ' + CLAUDE_MODEL if (CLAUDE_ENABLED and ANTHROPIC_API_KEY) else '❌'}\n"
         f"Telegram: {'✅' if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else '❌'}\n"
         f"Tracker: {tracker}\n"
@@ -1220,39 +1243,40 @@ def ping():
 
 @app.route("/test", methods=["GET"])
 def test():
-    """Fire a realistic Pine v9 test signal — includes rvol field."""
+    """Fire a realistic Pine v9.1 test signal — includes icc_cct_confluence field."""
     fake = {
-        "secret":            WEBHOOK_SECRET,
-        "symbol":            "MGC1!",
-        "tf":                "15",
-        "session":           "NY-AM",
-        "tier":              "A+",
-        "conditions_met":    7,
-        "max_conditions":    7,
-        "signal":            "LONG",
-        "combo":             "2-2 Bull",
-        "price":             2650.50,
-        "stop":              2648.00,
-        "target1":           2654.25,
-        "target2":           2656.75,
-        "atr":               1.67,
-        "rvol":              1.84,          # Pine v9: always sent
-        "near_level":        "PDH",
-        "cct_open":          True,
-        "mins_to_close":     18,
-        "in_session":        True,
-        "in_preferred_sess": True,
-        # Pine v9 condition booleans (all hardened):
-        "cond_htf_bias":     True,
-        "cond_liq_sweep":    True,    # pivot-anchored
-        "cond_displacement": True,    # body + RVOL >= 1.3x
-        "cond_fvg_formed":   True,
-        "cond_fvg_retrace":  True,    # tap + close respects level
-        "cond_ltf_confirm":  True,
-        "cond_liq_target":   True,
+        "secret":               WEBHOOK_SECRET,
+        "symbol":               "MGC1!",
+        "tf":                   "15",
+        "session":              "NY-AM",
+        "tier":                 "A+",
+        "raw_tier":             "A+",
+        "conditions_met":       7,
+        "max_conditions":       7,
+        "signal":               "LONG",
+        "combo":                "2-2 Bull",
+        "price":                2650.50,
+        "stop":                 2648.00,
+        "target1":              2654.25,
+        "target2":              2656.75,
+        "atr":                  1.67,
+        "rvol":                 1.84,
+        "icc_cct_confluence":   True,      # Pine v9.1: displacement + CCT on same bar
+        "near_level":           "PDH",
+        "cct_open":             True,
+        "mins_to_close":        18,
+        "in_session":           True,
+        "in_preferred_sess":    True,
+        "cond_htf_bias":        True,
+        "cond_liq_sweep":       True,
+        "cond_displacement":    True,
+        "cond_fvg_formed":      True,
+        "cond_fvg_retrace":     True,
+        "cond_ltf_confirm":     True,
+        "cond_liq_target":      True,
     }
     threading.Thread(target=process_signal_async, args=(fake,), daemon=True).start()
-    return jsonify({"test": "dispatched", "pine_version": "v9"})
+    return jsonify({"test": "dispatched", "pine_version": "v9.1"})
 
 # ── STARTUP ───────────────────────────────────────────────────
 load_state()
