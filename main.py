@@ -1,14 +1,15 @@
 """
-KRONUS AI — main.py v7
-Fully matched to Pine v9.3.
-Changes from v6:
-  - Version strings updated to v9.3 throughout
-  - Signal card shows mss_active, pd_zone, atr_expanding
-  - Claude prompt updated: v9.3 gate logic, MSS, PD zone, ATR expansion
-  - Stats: PD zone breakdown + MSS confluence breakdown added
-  - Test route payload includes all v9.3 fields
-  - Home route reports pine v9.3
-  - status() reports pine v9.3
+KRONUS AI — main.py v8
+Paired with Pine v9.6.
+Changes from v7:
+  - Version strings updated to v9.6 throughout
+  - Entry price now uses directional `entry` field (slippage-adjusted) from Pine
+  - Signal card shows enter_ok (ENTER vs SKIP from bonus score)
+  - Dual CCT window support — card shows pit vs electronic window
+  - Claude prompt updated to v9.6 logic (dual CCT, enter_ok, PD filter off default)
+  - Test payload updated with all v9.6 fields
+  - Status route reports Pine v9.6
+  - Removed unused/dead code and redundant comments
 """
 import os, json, logging, threading, time
 from copy import deepcopy
@@ -90,10 +91,10 @@ def load_state():
 def validate_signal(sig):
     if not isinstance(sig, dict):
         return False, "not a dict"
-    for f in ["symbol", "signal", "price", "stop", "target1", "target2"]:
+    for f in ["symbol", "signal", "entry", "stop", "target1", "target2"]:
         if sig.get(f) is None:
             return False, f"missing {f}"
-    for f in ["price", "stop", "target1", "target2"]:
+    for f in ["entry", "stop", "target1", "target2"]:
         try:
             v = float(sig[f])
             if v != v:
@@ -143,15 +144,15 @@ def signal_btns(sig):
 
 def resolved_btns():
     return {"inline_keyboard": [[
-        {"text": "📊 Today", "callback_data": "today"},
-        {"text": "📈 Stats", "callback_data": "stats"},
+        {"text": "📊 Today",   "callback_data": "today"},
+        {"text": "📈 Stats",   "callback_data": "stats"},
         {"text": "📋 Journal", "callback_data": "journal"},
     ]]}
 
 def menu_btns():
     return {"inline_keyboard": [
-        [{"text": "📊 Today", "callback_data": "today"}, {"text": "📋 Journal", "callback_data": "journal"}],
-        [{"text": "📈 Stats", "callback_data": "stats"}, {"text": "⏸ Skipped", "callback_data": "skipped"}],
+        [{"text": "📊 Today",     "callback_data": "today"},   {"text": "📋 Journal", "callback_data": "journal"}],
+        [{"text": "📈 Stats",     "callback_data": "stats"},   {"text": "⏸ Skipped",  "callback_data": "skipped"}],
         [{"text": "🔥 Checklist", "callback_data": "open_checklist"}, {"text": "⚙️ Status", "callback_data": "status"}],
     ]}
 
@@ -163,46 +164,54 @@ def fmt_card(sig, ana=None):
     tier     = sig.get("tier", "?")
     raw_tier = sig.get("raw_tier", tier)
     icc_cct  = sig.get("icc_cct_confluence", False)
+    enter_ok = sig.get("enter_ok", False)
 
     tier_line = tier
     if raw_tier != tier and raw_tier == "B+":
         tier_line = f"{tier} _(B+ upgraded via CCT)_"
 
-    rvol_raw = sig.get("rvol")
+    # ENTER vs SKIP badge
+    enter_badge = "🟢 *ENTER*" if enter_ok else "🟡 *SKIP*"
+
     try:
-        rf = float(rvol_raw)
+        rf = float(sig.get("rvol"))
         rvol_txt = ("✦ " if rf >= 1.5 else "⚠ " if rf < 1.3 else "") + f"{rf:.2f}x"
     except (TypeError, ValueError):
         rvol_txt = "—"
 
-    cct_line  = f"✓ {sig.get('mins_to_close')}m to close" if sig.get("cct_open") else "—"
-    sweep_txt = "✓ pivot" if sig.get("cond_liq_sweep") else "—"
+    # CCT — show which window is active
+    if sig.get("cct_open"):
+        mins = sig.get("mins_to_close", "?")
+        cct_line = f"✓ {mins}m to close"
+    else:
+        cct_line = "—"
+
     conf_line = "\n⭐ *ICC+CCT CONFLUENCE — Displacement at close*\n" if icc_cct else ""
 
-    # ── v9.3 new fields ──────────────────────────────────────
-    mss_active   = sig.get("mss_active", False)
-    pd_zone      = sig.get("pd_zone", "—")
-    atr_exp      = sig.get("atr_expanding")
+    mss_active = sig.get("mss_active", False)
+    pd_zone    = sig.get("pd_zone", "—")
+    atr_exp    = sig.get("atr_expanding")
 
     mss_txt = "🔵 ACTIVE" if mss_active else "—"
-    pd_txt  = ("✅ " if pd_zone == "Discount" and sig.get("signal") == "LONG"
-               else "✅ " if pd_zone == "Premium" and sig.get("signal") == "SHORT"
-               else "⚠️ ") + pd_zone if pd_zone not in ("—", None) else "—"
-    atr_txt = ("📈 Expanding" if atr_exp is True
-               else "📉 Contracting" if atr_exp is False
-               else "—")
+    if pd_zone not in ("—", None):
+        correct = (pd_zone == "Discount" and sig.get("signal") == "LONG") or \
+                  (pd_zone == "Premium"  and sig.get("signal") == "SHORT")
+        pd_txt = ("✅ " if correct else "⚠️ ") + pd_zone
+    else:
+        pd_txt = "—"
+    atr_txt = "📈 Expanding" if atr_exp is True else "📉 Contracting" if atr_exp is False else "—"
 
     body = (
-        f"{d} *{sig.get('symbol')} — {sig.get('signal')}*{'  ⚡' if not ana else ''}\n"
+        f"{d} *{sig.get('symbol')} — {sig.get('signal')}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Tier:* {tier_line}  |  *Conds:* {conds}/{max_c}\n"
+        f"*Tier:* {tier_line}  |  *Conds:* {conds}/{max_c}  |  {enter_badge}\n"
         f"*Session:* {sig.get('session')}  |  *TF:* {sig.get('tf')}m\n"
         f"*Combo:* {sig.get('combo')}\n\n"
-        f"*Entry:* `{sig.get('price')}`\n"
+        f"*Entry:* `{sig.get('entry')}`\n"
         f"*Stop:*  `{sig.get('stop')}`\n"
         f"*TP1:*   `{sig.get('target1')}`\n"
         f"*TP2:*   `{sig.get('target2')}`\n\n"
-        f"*RVOL:* {rvol_txt}  |  *Sweep:* {sweep_txt}  |  *Lvl:* {sig.get('near_level', '—')}\n"
+        f"*RVOL:* {rvol_txt}  |  *Sweep:* {'✓ pivot' if sig.get('cond_liq_sweep') else '—'}  |  *Lvl:* {sig.get('near_level', '—')}\n"
         f"*CCT:* {cct_line}{conf_line}\n"
         f"*MSS:* {mss_txt}  |  *PD:* {pd_txt}  |  *ATR:* {atr_txt}\n"
         f"━━━━━━━━━━━━━━━━━━━━"
@@ -219,13 +228,12 @@ def fmt_mode(trade):
     mode = trade.get("mode", "pending")
     if mode == "pending":
         return ""
-    e = {"live": "✅", "paper": "📝", "skipped": "⏸"}.get(mode, "•")
-    l = mode.upper()
+    e  = {"live": "✅", "paper": "📝", "skipped": "⏸"}.get(mode, "•")
     try:
         ts = datetime.fromisoformat(trade.get("action_time", trade["entry_time"])).strftime("%H:%M:%S")
     except Exception:
         ts = "??"
-    return f"\n\n{e} *{l}* at {ts}"
+    return f"\n\n{e} *{mode.upper()}* at {ts}"
 
 def fmt_result(trade):
     r = trade.get("result")
@@ -263,9 +271,9 @@ def autofill(sig):
 def grade(state):
     s_on  = state.get("c0", False)
     other = sum(1 for k, _ in CHECKLIST_ITEMS[1:] if state.get(k, False))
-    if other == 7 and s_on:             return "A+", "Perfect — TAKE IT", "🔥"
-    if other == 7 or (other == 6 and s_on): return "A", "Strong trade", "✅"
-    if other >= 5:                      return "B+", "Decent — size down", "⚠️"
+    if other == 7 and s_on:                  return "A+", "Perfect — TAKE IT", "🔥"
+    if other == 7 or (other == 6 and s_on):  return "A",  "Strong trade",       "✅"
+    if other >= 5:                           return "B+", "Decent — size down", "⚠️"
     return "B", "Weak — SKIP", "❌"
 
 def cl_header(state):
@@ -275,7 +283,10 @@ def cl_header(state):
 
 def cl_keys(state, mid):
     rows = [[{"text": ("✅" if state.get(k) else "⬜") + f"  {lbl}", "callback_data": f"cl_toggle|{mid}|{k}"}] for k, lbl in CHECKLIST_ITEMS]
-    rows.append([{"text": "📊 Grade", "callback_data": f"cl_grade|{mid}"}, {"text": "🔄 Reset", "callback_data": f"cl_reset|{mid}"}])
+    rows.append([
+        {"text": "📊 Grade",  "callback_data": f"cl_grade|{mid}"},
+        {"text": "🔄 Reset",  "callback_data": f"cl_reset|{mid}"},
+    ])
     return {"inline_keyboard": rows}
 
 def send_checklist(sig_or_state, is_state=False):
@@ -292,34 +303,32 @@ def send_checklist(sig_or_state, is_state=False):
 def analyze(sig):
     if not CLAUDE_ENABLED or not ANTHROPIC_API_KEY:
         return {"verdict": "REVIEW", "confidence": "N/A", "key_factor": "Claude off", "reasoning": "Trade on own read."}
+
     try:
-        rf = float(sig.get("rvol", 0))
-        rvol_s = f"{rf:.2f}x"
+        rvol_s = f"{float(sig.get('rvol', 0)):.2f}x"
     except (TypeError, ValueError):
         rvol_s = "N/A"
 
-    icc_cct  = "YES ⭐" if sig.get("icc_cct_confluence") else "no"
     tier     = sig.get("tier", "?")
     raw_t    = sig.get("raw_tier", tier)
     upgrade  = f" (upgraded from {raw_t} via ICC+CCT)" if raw_t != tier else ""
+    icc_cct  = "YES ⭐" if sig.get("icc_cct_confluence") else "no"
+    enter_ok = "YES — bonus conditions met" if sig.get("enter_ok") else "NO — SKIP signal"
+    mss_txt  = "YES — structure confirmed flip" if sig.get("mss_active") else "no"
+    pd_zone  = sig.get("pd_zone", "unknown")
+    atr_txt  = "expanding (trending)" if sig.get("atr_expanding") is True else "contracting (chop risk)" if sig.get("atr_expanding") is False else "unknown"
 
-    # v9.3 extras for Claude context
-    mss_active  = sig.get("mss_active", False)
-    pd_zone     = sig.get("pd_zone", "unknown")
-    atr_exp     = sig.get("atr_expanding", None)
-    mss_txt     = "YES — structure confirmed flip" if mss_active else "no"
-    atr_txt     = "expanding (trending)" if atr_exp is True else "contracting (chop risk)" if atr_exp is False else "unknown"
-
-    prompt = f"""Kronus AI v9.3 futures signal review. Pine v9.3 gates are strict:
-C2 sweep anchored to confirmed pivot. C3 displacement needs body AND RVOL>=1.3x. C5 FVG retrace needs wick tap + close respects level. FVGs below 0.3x ATR are filtered out as noise. B+ upgrades to A when ICC+CCT fires.
-NEW in v9.3: MSS (market structure shift) confirms sweep actually flipped structure. PD zone filters longs to discount (<50% EQ) and shorts to premium (>50% EQ). ATR expansion flags trending vs contracting volatility.
-Be lenient on A/A+ — only flag WAIT for a concrete red flag. Flag WAIT if PD zone is wrong side for the direction and MSS is absent.
+    prompt = f"""Kronus AI v9.6 futures signal review. Gate logic:
+C2 sweep anchored to confirmed pivot (len=2). C3 displacement needs body >1.1x avg AND RVOL>=1.3x. C5 FVG retrace needs wick tap + close respects level. FVGs below 0.1x ATR filtered as noise. B+ upgrades to A when ICC+CCT fires.
+Dual CCT windows: metals pit close 12:30 CT and electronic close 15:00 CT.
+MSS confirms sweep flipped structure. PD filter is currently OFF by default — pd_zone shown for context only unless filter re-enabled. ATR expansion flags trending vs contracting. enter_ok = bonus score (MSS + PD + ATR) met threshold.
+Be lenient on A/A+ — only flag WAIT for a concrete red flag.
 
 {sig.get('symbol')} {sig.get('signal')} | Tier {tier}{upgrade} | {sig.get('conditions_met','?')}/{sig.get('max_conditions',7)} conds | {sig.get('session')} {sig.get('tf')}m
-Entry {sig.get('price')} Stop {sig.get('stop')} TP1 {sig.get('target1')} TP2 {sig.get('target2')} ATR {sig.get('atr')} RVOL {rvol_s}
-C1 HTF:{sig.get('cond_htf_bias')} C2 Sweep:{sig.get('cond_liq_sweep')} C3 Disp+Vol:{sig.get('cond_displacement')} C4 FVG:{sig.get('cond_fvg_formed')} C5 Retrace:{sig.get('cond_fvg_retrace')} C6 LTF:{sig.get('cond_ltf_confirm')} C7 Target:{sig.get('cond_liq_target')}
-ICC+CCT confluence: {icc_cct} | Near: {sig.get('near_level','none')} | CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m) | Pref session: {sig.get('in_preferred_sess')}
-MSS confirmed: {mss_txt} | PD zone: {pd_zone} | ATR state: {atr_txt}
+Entry {sig.get('entry')} Stop {sig.get('stop')} TP1 {sig.get('target1')} TP2 {sig.get('target2')} ATR {sig.get('atr')} RVOL {rvol_s}
+C1 HTF:{sig.get('cond_htf_bias')} C2 Sweep:{sig.get('cond_liq_sweep')} C3 Disp:{sig.get('cond_displacement')} C4 FVG:{sig.get('cond_fvg_formed')} C5 Retrace:{sig.get('cond_fvg_retrace')} C6 LTF:{sig.get('cond_ltf_confirm')} C7 Target:{sig.get('cond_liq_target')}
+ICC+CCT: {icc_cct} | Enter OK: {enter_ok} | Near: {sig.get('near_level','none')} | CCT: {sig.get('cct_open')} ({sig.get('mins_to_close')}m) | Pref session: {sig.get('in_preferred_sess')}
+MSS: {mss_txt} | PD zone: {pd_zone} | ATR state: {atr_txt}
 
 Return ONLY JSON: {{"verdict":"BUY|SELL|WAIT","confidence":"HIGH|MEDIUM|LOW","key_factor":"one sentence","reasoning":"2 sentences"}}"""
 
@@ -345,16 +354,26 @@ Return ONLY JSON: {{"verdict":"BUY|SELL|WAIT","confidence":"HIGH|MEDIUM|LOW","ke
 def process(sig):
     try:
         msg_id = int(tg("sendMessage", {
-            "chat_id": TELEGRAM_CHAT_ID, "text": fmt_card(sig),
-            "parse_mode": "Markdown", "reply_markup": signal_btns(sig),
+            "chat_id":      TELEGRAM_CHAT_ID,
+            "text":         fmt_card(sig),
+            "parse_mode":   "Markdown",
+            "reply_markup": signal_btns(sig),
         }).get("result", {}).get("message_id", 0))
         if not msg_id:
             return
         now = datetime.now(timezone.utc).isoformat()
         trade = {
-            "trade_id": str(msg_id), "message_id": msg_id, "sig": sig, "ana": None,
-            "mode": "pending", "entry_time": now, "action_time": None,
-            "result": None, "result_time": None, "mfe": 0.0, "mae": 0.0,
+            "trade_id":    str(msg_id),
+            "message_id":  msg_id,
+            "sig":         sig,
+            "ana":         None,
+            "mode":        "pending",
+            "entry_time":  now,
+            "action_time": None,
+            "result":      None,
+            "result_time": None,
+            "mfe":         0.0,
+            "mae":         0.0,
         }
         with STATE_LOCK:
             TRACKING[str(msg_id)] = trade
@@ -403,6 +422,23 @@ def all_trades():
     with STATE_LOCK:
         return [deepcopy(t) for t in TRACKING.values()]
 
+def _trade_date(t):
+    try:
+        return datetime.fromisoformat(t["entry_time"]).date()
+    except Exception:
+        return None
+
+def _fmt_ts(s):
+    try:
+        return datetime.fromisoformat(s).strftime("%m/%d %H:%M")
+    except Exception:
+        return "??"
+
+def _wr(arr):
+    w = sum(1 for t in arr if t.get("result") in ("TP1", "TP2"))
+    l = sum(1 for t in arr if t.get("result") == "STOP")
+    return w, l, f"{w / (w + l) * 100:.0f}%" if w + l else "—"
+
 def today_stats():
     today = datetime.now(timezone.utc).date()
     tt    = [t for t in all_trades() if _trade_date(t) == today]
@@ -429,9 +465,8 @@ def journal():
     lines = ["*📋 Last 10 confirmed*\n"]
     for t in tt[:10]:
         s  = t["sig"]
-        ts = _fmt_ts(t["entry_time"])
         e  = "✅" if t["mode"] == "live" else "📝"
-        lines.append(f"{e} `{ts}` {s.get('symbol')} *{s.get('signal')}* @ {s.get('price')} → {t.get('result') or 'open'}")
+        lines.append(f"{e} `{_fmt_ts(t['entry_time'])}` {s.get('symbol')} *{s.get('signal')}* @ {s.get('entry')} → {t.get('result') or 'open'}")
     return "\n".join(lines)
 
 def skipped():
@@ -452,102 +487,71 @@ def stats():
     if not resolved:
         return "*📈 Stats*\n\nNo resolved trades yet."
 
-    def wr(arr):
-        w = sum(1 for t in arr if t.get("result") in ("TP1", "TP2"))
-        l = sum(1 for t in arr if t.get("result") == "STOP")
-        return w, l, f"{w / (w + l) * 100:.0f}%" if w + l else "—"
-
     lines = [f"*📈 Stats* ({len(resolved)} resolved)\n"]
 
-    # By tier
     lines.append("*By Tier:*")
     for tier in ("A+", "A", "B+", "B"):
         arr = [t for t in resolved if t["sig"].get("tier") == tier]
         if arr:
-            w, l, pct = wr(arr)
-            lines.append(f"  {tier}: {w}W/{l}L — {pct} ({len(arr)} trades)")
+            w, l, pct = _wr(arr)
+            lines.append(f"  {tier}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # By session
     lines.append("\n*By Session:*")
     for sess in ("NY-AM", "London", "NY-PM", "Asia"):
         arr = [t for t in resolved if t["sig"].get("session", "").upper() == sess.upper()]
         if arr:
-            w, l, pct = wr(arr)
+            w, l, pct = _wr(arr)
             lines.append(f"  {sess}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # By combo
     lines.append("\n*By Combo:*")
     combos = {}
     for t in resolved:
-        c = t["sig"].get("combo", "?")
-        combos.setdefault(c, []).append(t)
+        combos.setdefault(t["sig"].get("combo", "?"), []).append(t)
     for c, arr in sorted(combos.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
-        w, l, pct = wr(arr)
+        w, l, pct = _wr(arr)
         lines.append(f"  {c}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # ICC+CCT confluence
     lines.append("\n*ICC+CCT Confluence:*")
-    with_conf    = [t for t in resolved if t["sig"].get("icc_cct_confluence")]
-    without_conf = [t for t in resolved if not t["sig"].get("icc_cct_confluence")]
-    if with_conf:
-        w, l, pct = wr(with_conf)
-        lines.append(f"  ⭐ With CCT: {w}W/{l}L — {pct} ({len(with_conf)})")
-    if without_conf:
-        w, l, pct = wr(without_conf)
-        lines.append(f"  No CCT: {w}W/{l}L — {pct} ({len(without_conf)})")
+    for label, fltr in [("⭐ With CCT", True), ("No CCT", False)]:
+        arr = [t for t in resolved if bool(t["sig"].get("icc_cct_confluence")) == fltr]
+        if arr:
+            w, l, pct = _wr(arr)
+            lines.append(f"  {label}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # ── v9.3 additions ───────────────────────────────────────
+    lines.append("\n*Enter OK vs Skip:*")
+    for label, fltr in [("🟢 ENTER", True), ("🟡 SKIP", False)]:
+        arr = [t for t in resolved if bool(t["sig"].get("enter_ok")) == fltr]
+        if arr:
+            w, l, pct = _wr(arr)
+            lines.append(f"  {label}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # MSS confirmed
-    lines.append("\n*MSS Confirmed (v9.3):*")
-    with_mss    = [t for t in resolved if t["sig"].get("mss_active")]
-    without_mss = [t for t in resolved if not t["sig"].get("mss_active")]
-    if with_mss:
-        w, l, pct = wr(with_mss)
-        lines.append(f"  🔵 MSS active: {w}W/{l}L — {pct} ({len(with_mss)})")
-    if without_mss:
-        w, l, pct = wr(without_mss)
-        lines.append(f"  No MSS: {w}W/{l}L — {pct} ({len(without_mss)})")
+    lines.append("\n*MSS Confirmed:*")
+    for label, fltr in [("🔵 MSS active", True), ("No MSS", False)]:
+        arr = [t for t in resolved if bool(t["sig"].get("mss_active")) == fltr]
+        if arr:
+            w, l, pct = _wr(arr)
+            lines.append(f"  {label}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # PD Zone
-    lines.append("\n*PD Zone (v9.3):*")
-    longs  = [t for t in resolved if t["sig"].get("signal") == "LONG"]
-    shorts = [t for t in resolved if t["sig"].get("signal") == "SHORT"]
-    l_disc = [t for t in longs  if t["sig"].get("pd_zone") == "Discount"]
-    l_prem = [t for t in longs  if t["sig"].get("pd_zone") == "Premium"]
-    s_prem = [t for t in shorts if t["sig"].get("pd_zone") == "Premium"]
-    s_disc = [t for t in shorts if t["sig"].get("pd_zone") == "Discount"]
-    if l_disc:
-        w, l, pct = wr(l_disc)
-        lines.append(f"  Longs in Discount: {w}W/{l}L — {pct} ({len(l_disc)})")
-    if l_prem:
-        w, l, pct = wr(l_prem)
-        lines.append(f"  Longs in Premium:  {w}W/{l}L — {pct} ({len(l_prem)}) ⚠️")
-    if s_prem:
-        w, l, pct = wr(s_prem)
-        lines.append(f"  Shorts in Premium: {w}W/{l}L — {pct} ({len(s_prem)})")
-    if s_disc:
-        w, l, pct = wr(s_disc)
-        lines.append(f"  Shorts in Discount:{w}W/{l}L — {pct} ({len(s_disc)}) ⚠️")
+    lines.append("\n*PD Zone:*")
+    for label, pd, sig in [("Longs in Discount", "Discount", "LONG"), ("Longs in Premium ⚠️", "Premium", "LONG"),
+                            ("Shorts in Premium", "Premium", "SHORT"), ("Shorts in Discount ⚠️", "Discount", "SHORT")]:
+        arr = [t for t in resolved if t["sig"].get("pd_zone") == pd and t["sig"].get("signal") == sig]
+        if arr:
+            w, l, pct = _wr(arr)
+            lines.append(f"  {label}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # ATR expansion
-    lines.append("\n*ATR State (v9.3):*")
-    expanding    = [t for t in resolved if t["sig"].get("atr_expanding") is True]
-    contracting  = [t for t in resolved if t["sig"].get("atr_expanding") is False]
-    if expanding:
-        w, l, pct = wr(expanding)
-        lines.append(f"  📈 Expanding: {w}W/{l}L — {pct} ({len(expanding)})")
-    if contracting:
-        w, l, pct = wr(contracting)
-        lines.append(f"  📉 Contracting: {w}W/{l}L — {pct} ({len(contracting)})")
+    lines.append("\n*ATR State:*")
+    for label, val in [("📈 Expanding", True), ("📉 Contracting", False)]:
+        arr = [t for t in resolved if t["sig"].get("atr_expanding") is val]
+        if arr:
+            w, l, pct = _wr(arr)
+            lines.append(f"  {label}: {w}W/{l}L — {pct} ({len(arr)})")
 
-    # By mode
     lines.append("\n*By Mode:*")
-    for mode in ("live", "paper", "skipped"):
+    for mode, e in [("live", "✅"), ("paper", "📝"), ("skipped", "⏸")]:
         arr = [t for t in resolved if t.get("mode") == mode]
         if arr:
-            w, l, pct = wr(arr)
-            e = {"live": "✅", "paper": "📝", "skipped": "⏸"}[mode]
+            w, l, pct = _wr(arr)
             lines.append(f"  {e} {mode.upper()}: {w}W/{l}L — {pct} ({len(arr)})")
 
     return "\n".join(lines)
@@ -557,25 +561,13 @@ def status():
         n     = len(TRACKING)
         open_ = sum(1 for t in TRACKING.values() if not t.get("result"))
     return (
-        f"*⚙️ Kronus AI v7*\n"
-        f"Pine: v9.3 | Chart: A/A+ only | ICC+CCT + MSS + PD zone + ATR gate\n"
+        f"*⚙️ Kronus AI v8*\n"
+        f"Pine: v9.6 | Chart: A/A+ only | Dual CCT + MSS + PD zone + ATR\n"
         f"Claude: {'✅ ' + CLAUDE_MODEL if CLAUDE_ENABLED and ANTHROPIC_API_KEY else '❌'}\n"
         f"Session filter: {'✅ ' + ', '.join(ALLOWED_SESSIONS) if FILTER_SESSIONS else '⛔ off'}\n"
         f"Timeout: {TRADE_TIMEOUT_HRS}h\n"
         f"Trades: {n} total | {open_} open"
     )
-
-def _trade_date(t):
-    try:
-        return datetime.fromisoformat(t["entry_time"]).date()
-    except Exception:
-        return None
-
-def _fmt_ts(s):
-    try:
-        return datetime.fromisoformat(s).strftime("%m/%d %H:%M")
-    except Exception:
-        return "??"
 
 # ── ROUTES ────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
@@ -583,7 +575,7 @@ def home():
     with STATE_LOCK:
         n = len(TRACKING)
         o = sum(1 for t in TRACKING.values() if not t.get("result"))
-    return jsonify({"status": "running", "version": "v7", "pine": "v9.3", "trades": n, "open": o})
+    return jsonify({"status": "running", "version": "v8", "pine": "v9.6", "trades": n, "open": o})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -657,9 +649,7 @@ def telegram():
         def set_mode(mode, msg):
             with STATE_LOCK:
                 t = TRACKING.get(tid)
-                if not t:
-                    return None
-                if t.get("mode") != "pending":
+                if not t or t.get("mode") != "pending":
                     return None
                 t["mode"]        = mode
                 t["action_time"] = datetime.now(timezone.utc).isoformat()
@@ -669,15 +659,9 @@ def telegram():
             edit_msg(msg_id, render(tc), btns_for(tc))
             return tc
 
-        if action == "confirm":
-            if not set_mode("live", "✅ Live logged"):
-                answer_cb(cb_id, "Already acted", alert=True)
-        elif action == "paper":
-            if not set_mode("paper", "📝 Paper logged"):
-                answer_cb(cb_id, "Already acted", alert=True)
-        elif action == "skip":
-            if not set_mode("skipped", "⏸ Skipped"):
-                answer_cb(cb_id, "Already acted", alert=True)
+        if   action == "confirm": set_mode("live",    "✅ Live logged")   or answer_cb(cb_id, "Already acted", alert=True)
+        elif action == "paper":   set_mode("paper",   "📝 Paper logged")  or answer_cb(cb_id, "Already acted", alert=True)
+        elif action == "skip":    set_mode("skipped", "⏸ Skipped")       or answer_cb(cb_id, "Already acted", alert=True)
         elif action == "today":   answer_cb(cb_id); send_text(today_stats(), menu_btns())
         elif action == "journal": answer_cb(cb_id); send_text(journal(),     menu_btns())
         elif action == "skipped": answer_cb(cb_id); send_text(skipped(),     menu_btns())
@@ -688,7 +672,8 @@ def telegram():
 
     if "message" in upd:
         txt = upd["message"].get("text", "").strip().lower()
-        if txt in ("/menu", "/start"): send_text("*Kronus AI v7*", menu_btns())
+        if txt in ("/menu", "/start"):
+            send_text("*Kronus AI v8*", menu_btns())
         elif txt == "/checklist":
             with STATE_LOCK:
                 recent = sorted(TRACKING.values(), key=lambda t: t.get("entry_time", ""), reverse=True)
@@ -710,42 +695,40 @@ def setup_telegram():
 
 @app.route("/test", methods=["GET"])
 def test():
-    # Full v9.3 payload — matches Pine f_json() output exactly
     fake = {
-        "secret":               WEBHOOK_SECRET,
-        "symbol":               "MGC1!",
-        "tf":                   "15",
-        "session":              "NY-AM",
-        "tier":                 "A+",
-        "raw_tier":             "A+",
-        "conditions_met":       7,
-        "max_conditions":       7,
-        "signal":               "LONG",
-        "combo":                "2-1-2 Bull",
-        "price":                2650.50,
-        "stop":                 2648.00,
-        "target1":              2654.25,
-        "target2":              2658.50,
-        "atr":                  1.67,
-        "rvol":                 1.84,
-        "icc_cct_confluence":   True,
-        "near_level":           "PDH",
-        "cct_open":             True,
-        "mins_to_close":        18,
-        "in_session":           True,
-        "in_preferred_sess":    True,
-        # v9.3 new fields
-        "mss_active":           True,
-        "pd_zone":              "Discount",
-        "atr_expanding":        True,
-        # conditions
-        "cond_htf_bias":        True,
-        "cond_liq_sweep":       True,
-        "cond_displacement":    True,
-        "cond_fvg_formed":      True,
-        "cond_fvg_retrace":     True,
-        "cond_ltf_confirm":     True,
-        "cond_liq_target":      True,
+        "secret":             WEBHOOK_SECRET,
+        "symbol":             "MGC1!",
+        "tf":                 "1",
+        "session":            "NY-AM",
+        "tier":               "A+",
+        "raw_tier":           "A+",
+        "conditions_met":     7,
+        "max_conditions":     7,
+        "signal":             "LONG",
+        "combo":              "2-1-2 Bull",
+        "entry":              2650.50,
+        "stop":               2648.46,
+        "target1":            2652.54,
+        "target2":            2654.98,
+        "atr":                1.37,
+        "rvol":               1.84,
+        "icc_cct_confluence": True,
+        "near_level":         "PDH",
+        "cct_open":           True,
+        "mins_to_close":      14,
+        "in_session":         True,
+        "in_preferred_sess":  True,
+        "enter_ok":           True,
+        "mss_active":         True,
+        "pd_zone":            "Discount",
+        "atr_expanding":      True,
+        "cond_htf_bias":      True,
+        "cond_liq_sweep":     True,
+        "cond_displacement":  True,
+        "cond_fvg_formed":    True,
+        "cond_fvg_retrace":   True,
+        "cond_ltf_confirm":   True,
+        "cond_liq_target":    True,
     }
     threading.Thread(target=process, args=(fake,), daemon=True).start()
     return jsonify({"status": "dispatched"})
@@ -760,5 +743,5 @@ threading.Thread(target=timeout_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    log.info(f"Kronus AI v7 — Pine v9.3 — port {port}")
+    log.info(f"Kronus AI v8 — Pine v9.6 — port {port}")
     app.run(host="0.0.0.0", port=port, threaded=True)
